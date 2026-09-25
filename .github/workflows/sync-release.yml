@@ -182,6 +182,8 @@ jobs:
           PARENT=""
           if git fetch -q --depth 1 origin "refs/tags/${TAG}" 2>/dev/null; then
             PARENT="$(git rev-parse FETCH_HEAD)"
+            # keep the tag resolvable locally for the archive step below
+            git update-ref "refs/tags/${TAG}" "${PARENT}"
             echo "::notice::existing ${TAG} parent: ${PARENT}"
           fi
 
