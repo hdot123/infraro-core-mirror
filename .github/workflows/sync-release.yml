@@ -8,6 +8,15 @@ name: sync-release
 #   workflow_dispatch   manual / catch-up sync of one tag (or the latest release)
 #   repository_dispatch upstream release event forwarded from the source repo
 #   schedule            polling fallback so new releases are mirrored unattended
+#
+# Credential boundary (GitHub platform rule, not a choice):
+#   The default GITHUB_TOKEN is an App installation token and may never create
+#   or update files under .github/workflows/. The snapshot commit therefore has
+#   to be pushed with a credential that carries the `workflows` permission:
+#   set the repository secret MIRROR_PUSH_TOKEN (fine-grained token or App
+#   installation token with contents:write + workflows:write) to keep the
+#   mirror's reusable-workflow surface following new releases. Without it the
+#   job fails loudly instead of publishing a silently degraded snapshot.
 on:
   workflow_dispatch:
     inputs:
@@ -151,18 +160,47 @@ jobs:
         if: steps.fetch.outputs.skip != 'true'
         env:
           TAG: ${{ steps.fetch.outputs.tag }}
+          MIRROR_PUSH_TOKEN: ${{ secrets.MIRROR_PUSH_TOKEN }}
         run: |
           set -euo pipefail
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git checkout --orphan "release/${TAG}"
+
+          if [ -n "${MIRROR_PUSH_TOKEN:-}" ]; then
+            # Token with the `workflows` permission: refresh the whole surface.
+            git config "http.https://github.com/.extraheader" \
+              "AUTHORIZATION: basic $(printf 'x-access-token:%s' "${MIRROR_PUSH_TOKEN}" | base64 -w0)"
+            echo "::notice::pushing with MIRROR_PUSH_TOKEN (full snapshot including the workflow surface)"
+          else
+            echo "::warning::MIRROR_PUSH_TOKEN is not configured; the default token cannot write the workflow surface"
+          fi
+
+          # Re-use the commit the tag already points at as parent when it exists,
+          # so a re-sync keeps the same tree and GitHub's workflow-file check sees
+          # no workflow-file change.
+          PARENT=""
+          if git fetch -q --depth 1 origin "refs/tags/${TAG}" 2>/dev/null; then
+            PARENT="$(git rev-parse FETCH_HEAD)"
+            echo "::notice::existing ${TAG} parent: ${PARENT}"
+          fi
+
           git rm -rfq --ignore-unmatch .
           cp -a "${RUNNER_TEMP}/snapshot/." .
           git add -A
-          git commit -q -m "release: mirror ${TAG} from upstream snapshot"
-          git tag -f "${TAG}"
-          git push --force origin "refs/tags/${TAG}"
-          git push --force origin "HEAD:refs/heads/release/${TAG}"
+          TREE="$(git write-tree)"
+          if [ -n "${PARENT}" ]; then
+            COMMIT="$(git commit-tree "${TREE}" -p "${PARENT}" -m "release: mirror ${TAG} from upstream snapshot")"
+          else
+            COMMIT="$(git commit-tree "${TREE}" -m "release: mirror ${TAG} from upstream snapshot")"
+          fi
+          git update-ref "refs/tags/${TAG}" "${COMMIT}"
+          git update-ref "refs/heads/release/${TAG}" "${COMMIT}"
+
+          if ! git push --force origin "refs/tags/${TAG}"; then
+            echo "::error::push rejected. If this is the 'workflow ... without workflows permission' rule, the"
+            echo "::error::snapshot introduces .github/workflows/ changes that only a token with the workflows"
+            echo "::error::permission can publish -- configure the MIRROR_PUSH_TOKEN repository secret."
+            exit 1
+          fi
+          git push --force origin "refs/heads/release/${TAG}"
 
       - name: Publish mirror release
         if: steps.fetch.outputs.skip != 'true'

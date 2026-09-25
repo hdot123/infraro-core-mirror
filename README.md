@@ -62,6 +62,17 @@ uses: hdot123/infraro-core-mirror/.github/workflows/evolution-scan.yml@v0.18.9
 
 文档、变更日志与脚本面**不改写**，继续指向真源。
 
+### 同步权限边界（GitHub 平台规则）
+
+GitHub 禁止 Actions 默认的 `GITHUB_TOKEN`（App 安装令牌）创建或更新 `.github/workflows/**`
+下的文件。因此：
+
+- 同步 workflow 默认以 `GITHUB_TOKEN` 推送；当快照引入 workflow 面变更时，推送会被平台拒绝，
+  job **fail-loud** 报错并指向修复方式（不会静默发布残缺快照）。
+- 配置仓库 secret `MIRROR_PUSH_TOKEN`（带 `contents:write` + `workflows:write` 的细粒度令牌
+  或 App 安装令牌）后，workflow 面随 release 自动刷新。
+- 同一个 tag 的重同步（`force=true`）不引入 workflow 面变更，因此无需该令牌即可通过。
+
 ## 权威性与支持
 
 - 真源：`hdot123/infraro-core`（私有）。本镜像只保证「与真源对应 release 一致的快照」。
