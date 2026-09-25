@@ -164,6 +164,9 @@ jobs:
         run: |
           set -euo pipefail
 
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
           if [ -n "${MIRROR_PUSH_TOKEN:-}" ]; then
             # Token with the `workflows` permission: refresh the whole surface.
             git config "http.https://github.com/.extraheader" \
