@@ -1,0 +1,214 @@
+name: sync-release
+
+# Mechanical mirroring: copy a source-repository release snapshot into this
+# public mirror. Zero hand-written content -- release notes, git snapshot and
+# release asset are all pulled from the source of truth and republished.
+#
+# Triggers:
+#   workflow_dispatch   manual / catch-up sync of one tag (or the latest release)
+#   repository_dispatch upstream release event forwarded from the source repo
+#   schedule            polling fallback so new releases are mirrored unattended
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Upstream tag to mirror (empty = latest upstream release)'
+        required: false
+        default: ''
+        type: string
+      force:
+        description: 'Re-sync even if this release already exists in the mirror'
+        required: false
+        default: false
+        type: boolean
+  repository_dispatch:
+    types: [upstream-release]
+  schedule:
+    - cron: '23 */6 * * *'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-release
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: sync
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      GH_TOKEN: ${{ github.token }}
+      UPSTREAM_REPO: hdot123/infraro-core
+    steps:
+      - name: Checkout mirror (main)
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+          persist-credentials: true
+
+      - name: Fetch upstream release snapshot
+        id: fetch
+        env:
+          # Optional. While the source repository is public the sync runs
+          # anonymously; once it becomes private this token (contents:read) is
+          # what keeps the mirror following new releases.
+          UPSTREAM_READ_TOKEN: ${{ secrets.UPSTREAM_READ_TOKEN }}
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+          DISPATCH_TAG: ${{ github.event.client_payload.tag }}
+          FORCE: ${{ github.event.inputs.force }}
+        run: |
+          set -euo pipefail
+
+          EVENT="${GITHUB_EVENT_NAME}"
+          WORK="${RUNNER_TEMP}/upstream"
+          SNAP="${RUNNER_TEMP}/snapshot"
+          ASSETS="${RUNNER_TEMP}/upstream-assets"
+          mkdir -p "${WORK}" "${SNAP}" "${ASSETS}"
+
+          upstream_curl() {
+            if [ -n "${UPSTREAM_READ_TOKEN:-}" ]; then
+              curl -H "Authorization: Bearer ${UPSTREAM_READ_TOKEN}" "$@"
+            else
+              curl "$@"
+            fi
+          }
+
+          soft_fail() {
+            echo "::warning::$1"
+            if [ "${EVENT}" = "workflow_dispatch" ]; then
+              echo "::error::$1"
+              exit 1
+            fi
+            echo "skip=true" >> "${GITHUB_OUTPUT}"
+            exit 0
+          }
+
+          TAG="${INPUT_TAG:-}"
+          [ -n "${TAG}" ] || TAG="${DISPATCH_TAG:-}"
+
+          if [ -z "${TAG}" ]; then
+            if ! upstream_curl -fsSL --retry 3 --retry-delay 5 --retry-all-errors --max-time 60 \
+              -H "Accept: application/vnd.github+json" \
+              -o "${WORK}/latest.json" \
+              "https://api.github.com/repos/${UPSTREAM_REPO}/releases/latest"; then
+              soft_fail "upstream latest release is not readable (private source without UPSTREAM_READ_TOKEN?)"
+            fi
+            TAG="$(jq -r '.tag_name // empty' "${WORK}/latest.json")"
+          fi
+          if [ -z "${TAG}" ]; then
+            soft_fail "no upstream tag to mirror"
+          fi
+
+          if ! upstream_curl -fsSL --retry 3 --retry-delay 5 --retry-all-errors --max-time 60 \
+            -H "Accept: application/vnd.github+json" \
+            -o "${WORK}/release.json" \
+            "https://api.github.com/repos/${UPSTREAM_REPO}/releases/tags/${TAG}"; then
+            soft_fail "upstream release ${TAG} is not readable"
+          fi
+
+          if [ "${FORCE:-}" != "true" ] && gh release view "${TAG}" >/dev/null 2>&1; then
+            echo "::notice::${TAG} is already mirrored; nothing to do (pass force=true to re-sync)"
+            echo "skip=true" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+          echo "skip=false" >> "${GITHUB_OUTPUT}"
+          echo "tag=${TAG}" >> "${GITHUB_OUTPUT}"
+
+          if ! upstream_curl -fsSL --retry 3 --retry-delay 5 --retry-all-errors --max-time 300 \
+            -o "${WORK}/source.tar.gz" \
+            "https://api.github.com/repos/${UPSTREAM_REPO}/tarball/${TAG}"; then
+            soft_fail "upstream source tarball ${TAG} is not readable"
+          fi
+          tar -xzf "${WORK}/source.tar.gz" -C "${SNAP}" --strip-components=1
+          if [ ! -f "${SNAP}/pyproject.toml" ]; then
+            echo "::error::unexpected upstream tarball layout (pyproject.toml missing)"
+            exit 1
+          fi
+
+          while IFS= read -r url; do
+            [ -n "${url}" ] || continue
+            name="$(basename "${url}")"
+            if [ "${name}" = "infraro-core-${TAG}.tar.gz" ]; then
+              echo "::warning::upstream asset ${name} would shadow the generated snapshot asset; skipped"
+              continue
+            fi
+            upstream_curl -fsSL --retry 3 --retry-delay 5 --retry-all-errors --max-time 300 \
+              -o "${ASSETS}/${name}" "${url}"
+          done < <(jq -r '.assets[]?.browser_download_url' "${WORK}/release.json")
+
+      - name: Desensitize and repoint self-references
+        if: steps.fetch.outputs.skip != 'true'
+        env:
+          TAG: ${{ steps.fetch.outputs.tag }}
+        run: |
+          set -euo pipefail
+          python3 scripts/mirror_snapshot.py "${RUNNER_TEMP}/snapshot" --tag "${TAG}"
+          python3 scripts/mirror_snapshot.py --check "${RUNNER_TEMP}/snapshot" --tag "${TAG}"
+
+      - name: Commit snapshot and push tag
+        if: steps.fetch.outputs.skip != 'true'
+        env:
+          TAG: ${{ steps.fetch.outputs.tag }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout --orphan "release/${TAG}"
+          git rm -rfq --ignore-unmatch .
+          cp -a "${RUNNER_TEMP}/snapshot/." .
+          git add -A
+          git commit -q -m "release: mirror ${TAG} from upstream snapshot"
+          git tag -f "${TAG}"
+          git push --force origin "refs/tags/${TAG}"
+          git push --force origin "HEAD:refs/heads/release/${TAG}"
+
+      - name: Publish mirror release
+        if: steps.fetch.outputs.skip != 'true'
+        env:
+          TAG: ${{ steps.fetch.outputs.tag }}
+        run: |
+          set -euo pipefail
+          ASSET="${RUNNER_TEMP}/infraro-core-${TAG}.tar.gz"
+          NOTES="${RUNNER_TEMP}/release-notes.md"
+
+          git archive --format=tar.gz --prefix="infraro-core-${TAG}/" -o "${ASSET}" "${TAG}"
+
+          {
+            echo "Mechanical mirror of \`${UPSTREAM_REPO}\` release \`${TAG}\` (zero hand-written content)."
+            echo
+            echo "- git snapshot + asset: sanitized for public exposure (private-network"
+            echo "  addresses, internal hostnames and local home paths are redacted)"
+            echo "- source of truth: https://github.com/${UPSTREAM_REPO}"
+            echo
+            jq -r '.body // ""' "${RUNNER_TEMP}/upstream/release.json"
+          } > "${NOTES}"
+
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            gh release edit "${TAG}" --title "${TAG}" --notes-file "${NOTES}"
+          else
+            gh release create "${TAG}" "${ASSET}" --verify-tag --title "${TAG}" --notes-file "${NOTES}"
+          fi
+          gh release upload "${TAG}" "${ASSET}" --clobber
+
+          for file in "${RUNNER_TEMP}/upstream-assets"/*; do
+            [ -e "${file}" ] || continue
+            gh release upload "${TAG}" "${file}" --clobber
+          done
+
+      - name: Summary
+        if: always()
+        env:
+          TAG: ${{ steps.fetch.outputs.tag }}
+          SKIP: ${{ steps.fetch.outputs.skip }}
+        run: |
+          {
+            echo "## mirror sync"
+            echo
+            if [ "${SKIP}" = "true" ]; then
+              echo "result: skipped (nothing to mirror)"
+            else
+              echo "result: mirrored \`${TAG}\`"
+            fi
+          } >> "${GITHUB_STEP_SUMMARY}"
