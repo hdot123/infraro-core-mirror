@@ -1,0 +1,5 @@
+=== Twin scripts diff (should be empty) ===
+=== Other gates (should be empty) ===
+NO_GATE_CHANGES
+=== watchdog/B1/P3 (should be empty) ===
+NO_EXCLUDED_CHANGES

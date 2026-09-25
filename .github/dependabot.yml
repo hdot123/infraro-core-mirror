@@ -1,0 +1,49 @@
+# Dependabot version updates for infraro-core (engine repo)
+#
+# Managed ecosystems:
+#   pip            -> Python runtime/dev dependencies (pyproject.toml + uv.lock)
+#   github-actions -> workflow action pins under .github/workflows
+#
+# Merging is not handled here: this repository runs a repo-wide auto-merge
+# workflow that squash-merges any PR once every check-run is green
+# (required: ci-ok + qa-ok + droid-review).
+version: 2
+updates:
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "Asia/Shanghai"
+    open-pull-requests-limit: 10
+    commit-message:
+      prefix: "chore(deps)"
+    groups:
+      production:
+        dependency-type: "production"
+        update-types:
+          - "minor"
+          - "patch"
+      development:
+        dependency-type: "development"
+        update-types:
+          - "minor"
+          - "patch"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "Asia/Shanghai"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(ci)"
+    # Engine workflows are owner-only (governance protection blocks
+    # non-hdot123 authors from modifying .github/workflows/**).
+    # Only track composite actions under actions/**, not workflows.
+    allow:
+      - dependency-name: "actions/*"
+        dependency-type: "direct"

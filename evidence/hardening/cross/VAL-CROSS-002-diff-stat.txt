@@ -1,0 +1,9 @@
+ .github/workflows/ci.yml                     |  30 +--
+ pyproject.toml                               |   1 +
+ src/infra_core/engine/evolution_heartbeat.py |  30 ++-
+ substrate/gates/gate1_interface.py           | 140 ++++++++++++--
+ tests/test_ci_structure_contract.py          |  66 +++++++
+ tests/test_core_delivery_import_contract.py  | 212 +++++++++++++++++++++
+ tests/test_evolution_heartbeat.py            | 114 ++++++++++-
+ tests/test_gate1_fail_closed.py              | 272 +++++++++++++++++++++++++++
+ 8 files changed, 827 insertions(+), 38 deletions(-)

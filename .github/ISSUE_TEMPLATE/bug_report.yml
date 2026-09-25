@@ -1,0 +1,44 @@
+name: Bug Report
+description: 报告一个缺陷（复现步骤、期望/实际行为）
+labels: ["bug", "needs-triage"]
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: 缺陷描述
+      description: 发生了什么？与期望行为的差异是什么？
+      placeholder: 简述缺陷与影响面。
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: 复现步骤
+      description: 最小复现序列（命令/操作步骤）。
+      placeholder: |
+        1. 运行 `...`
+        2. 观察 ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期望行为
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: 环境
+      description: Python 版本、OS、infra-cli/引擎版本（uv.lock 或 importlib.metadata 版本号）。
+      placeholder: "Python 3.12.x / macOS / infraro-core vX.Y.Z"
+    validations:
+      required: false
+  - type: textarea
+    id: logs
+    attributes:
+      label: 相关日志/输出
+      description: 请粘贴文本日志（勿截图），敏感信息先脱敏。
+      render: shell
+    validations:
+      required: false

@@ -1,0 +1,60 @@
+[1m============================= test session starts ==============================[0m
+platform darwin -- Python 3.12.13, pytest-9.1.1, pluggy-1.6.0 -- ~/infraro-core/.venv/bin/python
+cachedir: .pytest_cache
+rootdir: ~/infraro-core
+configfile: pyproject.toml
+plugins: cov-7.1.0, xdist-3.8.0, timeout-2.4.0
+timeout: 300.0s
+timeout method: signal
+timeout func_only: False
+[1mcollecting ... [0mcollected 47 items
+
+tests/test_ci_structure_contract.py::TestJobTopology::test_expected_job_set_present [32mPASSED[0m[32m [  2%][0m
+tests/test_ci_structure_contract.py::TestJobTopology::test_ci_ok_needs_all_blocking_jobs [32mPASSED[0m[32m [  4%][0m
+tests/test_ci_structure_contract.py::TestJobTopology::test_ci_ok_always_runs [32mPASSED[0m[32m [  6%][0m
+tests/test_ci_structure_contract.py::TestConcurrencyContract::test_concurrency_group_expression [32mPASSED[0m[32m [  8%][0m
+tests/test_ci_structure_contract.py::TestConcurrencyContract::test_cancel_in_progress_pr_only [32mPASSED[0m[32m [ 10%][0m
+tests/test_ci_structure_contract.py::TestCiOkEnforcement::test_each_blocking_job_enforced [32mPASSED[0m[32m [ 12%][0m
+tests/test_ci_structure_contract.py::TestCiOkEnforcement::test_advisory_blocks_merge [32mPASSED[0m[32m [ 14%][0m
+tests/test_ci_structure_contract.py::TestAdvisorySemantics::test_advisory_no_continue_on_error[advisory-bundle] [32mPASSED[0m[32m [ 17%][0m
+tests/test_ci_structure_contract.py::TestSubstrateGates::test_gate_job_has_no_job_level_continue_on_error [32mPASSED[0m[32m [ 19%][0m
+tests/test_ci_structure_contract.py::TestSubstrateGates::test_gate_steps_have_no_continue_on_error [32mPASSED[0m[32m [ 21%][0m
+tests/test_ci_structure_contract.py::TestSubstrateGates::test_gate_job_in_ci_ok_needs [32mPASSED[0m[32m [ 23%][0m
+tests/test_ci_structure_contract.py::TestSubstrateGates::test_gate_job_runs_all_five_gates [32mPASSED[0m[32m [ 25%][0m
+tests/test_ci_structure_contract.py::TestNotifyCiComplete::test_notify_job_needs_ci_ok_and_always [32mPASSED[0m[32m [ 27%][0m
+tests/test_ci_structure_contract.py::TestNotifyCiComplete::test_payload_includes_status_and_run_url [32mPASSED[0m[32m [ 29%][0m
+tests/test_ci_structure_contract.py::TestNotifyCiComplete::test_delivery_failure_non_blocking_with_telemetry [32mPASSED[0m[32m [ 31%][0m
+tests/test_ci_structure_contract.py::TestNotifyCiComplete::test_run_steps_use_strict_mode [32mPASSED[0m[32m [ 34%][0m
+tests/test_ci_structure_contract.py::TestRunnerLabels::test_all_jobs_on_self_hosted_runner[advisory-bundle] [32mPASSED[0m[32m [ 36%][0m
+tests/test_ci_structure_contract.py::TestRunnerLabels::test_all_jobs_on_self_hosted_runner[ci-ok] [32mPASSED[0m[32m [ 38%][0m
+tests/test_ci_structure_contract.py::TestRunnerLabels::test_all_jobs_on_self_hosted_runner[e2e-tests] [32mPASSED[0m[32m [ 40%][0m
+tests/test_ci_structure_contract.py::TestRunnerLabels::test_all_jobs_on_self_hosted_runner[gate-tests] [32mPASSED[0m[32m [ 42%][0m
+tests/test_ci_structure_contract.py::TestRunnerLabels::test_all_jobs_on_self_hosted_runner[guards] [32mPASSED[0m[32m [ 44%][0m
+tests/test_ci_structure_contract.py::TestRunnerLabels::test_all_jobs_on_self_hosted_runner[health-check] [32mPASSED[0m[32m [ 46%][0m
+tests/test_ci_structure_contract.py::TestRunnerLabels::test_all_jobs_on_self_hosted_runner[integration-tests] [32mPASSED[0m[32m [ 48%][0m
+tests/test_ci_structure_contract.py::TestRunnerLabels::test_all_jobs_on_self_hosted_runner[lint-bundle] [32mPASSED[0m[32m [ 51%][0m
+tests/test_ci_structure_contract.py::TestRunnerLabels::test_all_jobs_on_self_hosted_runner[notify-ci-complete] [32mPASSED[0m[32m [ 53%][0m
+tests/test_ci_structure_contract.py::TestRunnerLabels::test_all_jobs_on_self_hosted_runner[pytest] [32mPASSED[0m[32m [ 55%][0m
+tests/test_ci_structure_contract.py::TestRunnerLabels::test_all_jobs_on_self_hosted_runner[test-groups] [32mPASSED[0m[32m [ 57%][0m
+tests/test_ci_structure_contract.py::TestRunnerLabels::test_all_jobs_on_self_hosted_runner[type-bundle] [32mPASSED[0m[32m [ 59%][0m
+tests/test_ci_structure_contract.py::TestBundles::test_lint_bundle_four_in_one [32mPASSED[0m[32m [ 61%][0m
+tests/test_ci_structure_contract.py::TestBundles::test_type_bundle_mypy_x2 [32mPASSED[0m[32m [ 63%][0m
+tests/test_ci_structure_contract.py::TestBundles::test_advisory_bundle_three_in_one [32mPASSED[0m[32m [ 65%][0m
+tests/test_ci_structure_contract.py::TestBundles::test_test_groups_three_segments_ordered [32mPASSED[0m[32m [ 68%][0m
+tests/test_ci_structure_contract.py::TestTestGroups::test_group_runs_marker_with_parallelism[e2e-tests-e2e] [32mPASSED[0m[32m [ 70%][0m
+tests/test_ci_structure_contract.py::TestTestGroups::test_group_runs_marker_with_parallelism[integration-tests-integration] [32mPASSED[0m[32m [ 72%][0m
+tests/test_ci_structure_contract.py::TestTestGroups::test_bundle_segments_keep_parallelism_contract [32mPASSED[0m[32m [ 74%][0m
+tests/test_ci_structure_contract.py::TestDomainMypy::test_src_strict [32mPASSED[0m[32m [ 76%][0m
+tests/test_ci_structure_contract.py::TestDomainMypy::test_scripts_strict [32mPASSED[0m[32m [ 78%][0m
+tests/test_ci_structure_contract.py::TestExistingJobInvariants::test_pytest_main_command_unchanged [32mPASSED[0m[32m [ 80%][0m
+tests/test_ci_structure_contract.py::TestExistingJobInvariants::test_guards_run_all_four_guard_scripts [32mPASSED[0m[32m [ 82%][0m
+tests/test_ci_structure_contract.py::TestExistingJobInvariants::test_e2e_includes_cli_smoke [32mPASSED[0m[32m [ 85%][0m
+tests/test_ci_structure_contract.py::TestActionlintHostFirst::test_host_binary_probe_present [32mPASSED[0m[32m [ 87%][0m
+tests/test_ci_structure_contract.py::TestActionlintHostFirst::test_host_version_gate [32mPASSED[0m[32m [ 89%][0m
+tests/test_ci_structure_contract.py::TestActionlintHostFirst::test_fallback_download_warns [32mPASSED[0m[32m [ 91%][0m
+tests/test_ci_structure_contract.py::TestActionlintHostFirst::test_download_only_after_host_probe [32mPASSED[0m[32m [ 93%][0m
+tests/test_ci_structure_contract.py::TestActionlintHostFirst::test_invocation_keeps_color_flag [32mPASSED[0m[32m [ 95%][0m
+tests/test_ci_structure_contract.py::TestCiOkStepOrder::test_droid_review_polling_precedes_zero_red_scan [32mPASSED[0m[32m [ 97%][0m
+tests/test_ci_structure_contract.py::TestCiOkStepOrder::test_moved_zero_red_step_keeps_execution_wiring [32mPASSED[0m[32m [100%][0m
+
+[32m============================== [32m[1m47 passed[0m[32m in 0.15s[0m[32m ==============================[0m

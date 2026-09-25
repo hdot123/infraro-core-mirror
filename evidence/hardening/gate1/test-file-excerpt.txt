@@ -1,0 +1,50 @@
+"""Gate 1 fail-closed 契约测试（audit-defense-hardening）
+
+Gate 1（`substrate/gates/gate1_interface.py`）的两个静默放行面改显式失败后，
+本文件锁定 fail-closed 语义与其回归边界：
+
+* 声明模板不可得（无 sibling checkout 且 gh api 失败）→ 显式错误 + 非零退出，
+  不再有 LOCAL-ONE 软通过分支；
+* 存在待验证的 ``vX.Y.Z`` ref 而引擎 tags 不可得（``git ls-remote`` 失败返回空集）
+  → 显式错误 + 非零退出，死引用检测不可静默跳过；
+* tags 可得时死引用检测保持（DEAD reference → 非零）；
+* `gate0-exemptions.md` ``## Gate 1`` 节注册 token 命中的 error 仍归 owned，
+  全部 owned → exit 0（存量豁免回归不变）。
+
+全部用例走 mock（patch 模块级 name import 的 ``fetch_decl_templates`` /
+``remote_tags``），零网络依赖，不调用 ``gh``。
+"""
+
+from __future__ import annotations
+
+import io
+import sys
+import tarfile
+import tempfile
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
+
+import pytest
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+GATES_DIR = REPO_ROOT / "substrate" / "gates"
+
+if str(GATES_DIR) not in sys.path:
+    sys.path.insert(0, str(GATES_DIR))
+
+import gate1_interface  # noqa: E402
+
+pytestmark = pytest.mark.business_policy
+
+# setup-labels.yml 暴露 workflow_call 且无 required-without-default 输入/secret，
+# 是最干净的目标面：fixture 只引入被测语义（ref/tags）带来的 error，不夹带
+# per-key 噪音。
+ENGINE_WORKFLOW = "hdot123/infraro-core/.github/workflows/setup-labels.yml"
+
+# gate0-exemptions.md `## Gate 1` 节登记的存量 break（watchdog.yml per-key），
+# 用于锁定「registered token 命中 → owned → 全部 owned exit 0」回归。
+WATCHDOG_REGISTERED_BREAK = """name: watchdog
+on:
+  workflow_dispatch:
+jobs:

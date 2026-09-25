@@ -1,0 +1,48 @@
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index 43b6253..14ba297 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -545,6 +545,21 @@ jobs:
+       - name: Checkout repository
+         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+ 
++      - name: Check droid-review status
++        env:
++          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
++        run: |
++          set -euo pipefail
++          # Poll for droid-review check run (separate workflow, not a ci.yml job).
++          # droid-review runs as a parallel workflow (Droid Auto Review) and produces
++          # its own check run. ci-ok must wait for it to complete before declaring
++          # the full CI suite green.
++          bash scripts/check_droid_review.sh \
++            "${{ github.event_name }}" \
++            "${{ github.repository }}" \
++            "${{ github.event.pull_request.head.sha || github.sha }}" \
++            "$GH_TOKEN"
++
+       - name: Zero-red aggregation (scan ALL check-runs via GitHub API)
+         env:
+           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+@@ -561,21 +576,6 @@ jobs:
+           # Use the standalone zero-red check script
+           bash scripts/check_zero_red.sh "${{ github.repository }}" "$COMMIT_SHA"
+ 
+-      - name: Check droid-review status
+-        env:
+-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+-        run: |
+-          set -euo pipefail
+-          # Poll for droid-review check run (separate workflow, not a ci.yml job).
+-          # droid-review runs as a parallel workflow (Droid Auto Review) and produces
+-          # its own check run. ci-ok must wait for it to complete before declaring
+-          # the full CI suite green.
+-          bash scripts/check_droid_review.sh \
+-            "${{ github.event_name }}" \
+-            "${{ github.repository }}" \
+-            "${{ github.event.pull_request.head.sha || github.sha }}" \
+-            "$GH_TOKEN"
+-
+   # ─── substrate gates: required checks (promoted from advisory) ───
+   # 解冻判据③：gate-tests 从 step-level continue-on-error (advisory) 转为 required check。
+   # 五道门持续运行输出红/绿；存量红项逐条登记于 substrate/gate0-exemptions.md，

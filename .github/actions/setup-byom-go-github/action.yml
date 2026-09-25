@@ -1,0 +1,97 @@
+name: "Setup BYOM go-github"
+description: "Write droid BYOM settings.json for the go-github AI Gateway chain (guard -> gateway -> opencode Go plan -> deepseek-v4.1-flash). Secrets enter ONLY via action inputs, never job env."
+
+inputs:
+  opencode-go-key:
+    description: "OpenCode Go subscription key (Authorization passthrough)"
+    required: true
+  go-github-run-token:
+    description: "go-github AI Gateway run token (cf-aig-authorization)"
+    required: true
+  byom-model:
+    description: "BYOM model ID for droid exec (-m, matches customModels[].id)"
+    required: false
+    default: "custom:DeepSeek-V4.1-Flash-Go"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Write BYOM settings file
+      shell: bash
+      env:
+        OPENCODE_GO_KEY: ${{ inputs.opencode-go-key }}
+        GO_GITHUB_RUN_TOKEN: ${{ inputs.go-github-run-token }}
+        BYOM_MODEL: ${{ inputs.byom-model }}
+      run: |
+        set -euo pipefail
+        # LLM 链路（go-github，2026-09-22 起动态路由）：CF AI Gateway
+        # 「go-github」@ 3-服务器管理子号（0a14f655）动态路由
+        # dynamic/droid-review：primary=deepseek-v4.1-flash @ opencode-go
+        # provider（custom provider base_url 已含 https://opencode.ai/zen/go
+        # 前缀），fallback=Workers AI llama。请求走 /compat 统一入口 +
+        # model=dynamic/droid-review，无需 custom provider 路径前缀段。
+        # 完全脱离 node01 内网（Kong/new-api 均不再经过），hosted runner
+        # 公网直达。
+        # 链路形态（实测 2026-09-22 E2E 200，model=deepseek-v4.1-flash）：
+        #   - cf-aig-authorization: 网关认证（run token，AI Gateway Run 权限）
+        #   - Authorization: opencode Go key 透传（custom provider 不做 BYOK
+        #     注入，与 my-free/custom-node01 行为一致，由客户端携带）
+        #   - x-opencode-session: OpenCode Go 硬性要求（缺头 400
+        #     MissingSessionID），按 shard 稳定以利路由与提示词缓存
+        #   - User-Agent: 自标识编程 agent（Go 条款要求，非通用 SDK UA）
+        # 凭证只经 action inputs → step env → settings.json，不落 job env
+        # （用户裁定 2026-09-21：BYOM 配置收敛 composite action）。
+        #
+        # 合并写铁律（2026-09-21 事故）：禁止 `cat >` 整文件覆盖——同脚本在
+        # 本机/自托管环境执行时会把用户已有 customModels 全部清空。
+        # 合并语义：BYOM 条目恒占 customModels[0]（引擎脚本 fallback 与凭证
+        # 注入都读 [0]），同 id 旧条目原位替换，其余模型原样保留。
+        mkdir -p ~/.factory
+        python3 << 'PYEOF'
+        import json, os
+
+        # 模型元数据内嵌为 raw-string JSON（不带凭证；凭证只在下方注入）
+        ENTRY = json.loads(r"""
+        {
+          "customModels": [
+            {
+              "model": "dynamic/droid-review",
+              "id": "custom:DeepSeek-V4.1-Flash-Go",
+              "displayName": "DeepSeek V4.1 Flash (OpenCode Go)",
+              "baseUrl": "https://gh.lumivane.dpdns.org/compat",
+              "apiKey": "",
+              "provider": "generic-chat-completion-api",
+              "maxOutputTokens": 65536,
+              "noImageSupport": true,
+              "extraHeaders": {}
+            }
+          ]
+        }
+        """)
+        byom = ENTRY['customModels'][0]
+        # Inject credentials + dynamic headers from step env (SHARD_ID/RUN_ID
+        # come from GITHUB_ENV of this job). KeyError here aborts BEFORE any
+        # file write, so a local dry-run without secrets never touches disk.
+        byom['apiKey'] = os.environ['OPENCODE_GO_KEY']
+        byom['extraHeaders'] = {
+            'cf-aig-authorization': 'Bearer ' + os.environ['GO_GITHUB_RUN_TOKEN'],
+            'x-opencode-session': 'droid-review-shard-' + os.environ.get('SHARD_ID', '0'),
+            'x-opencode-request': 'usr-droid-review-' + os.environ.get('RUN_ID', '0'),
+            'User-Agent': 'droid-ci/1.0',
+        }
+        p = os.path.expanduser('~/.factory/settings.json')
+        try:
+            d = json.load(open(p))
+        except FileNotFoundError:
+            d = {}
+        models = [m for m in d.get('customModels', []) if m.get('id') != byom['id']]
+        d['customModels'] = [byom] + models
+        json.dump(d, open(p, 'w'), indent=2)
+        print('BYOM settings merged: customModels[0]=%s (%d models total)'
+              % (byom['id'], len(d['customModels'])))
+        PYEOF
+
+    - name: Export BYOM model for engine script
+      shell: bash
+      run: |
+        echo "BYOM_MODEL=${{ inputs.byom-model }}" >> "$GITHUB_ENV"

@@ -1,0 +1,150 @@
+# Evolution Heartbeat reusable workflow（M4 抽离，architecture.md §6）
+# heartbeat 主体在本 reusable；消费仓定时触发面与命名契约
+# （名 'Evolution Heartbeat'）留在消费仓 thin caller。引擎内
+# SCANNER_WORKFLOW = "evolution-scan.yml" 指消费仓本仓文件名不变，
+# gh run list 按该文件名解析扫描器是否存活。
+#
+# INFRA-578/588 自愈闭环：heartbeat stale → trigger_scanner_dispatch 拉起
+# 扫描器；扫描器 watch_heartbeat_channel 反向拉起 heartbeat。
+#
+# INFRA-717 引擎仓自扫 schedule：同 evolution-scan.yml——本仓无法建独立
+# thin caller（heartbeat 探活按本文件名解析 run 历史），故本文件自带
+# schedule 恢复引擎仓自扫心跳定时面（M2 HOTFIX 禁 cron 后漏建，13h 空窗
+# 告警根因，见 evolution-scan.yml 文件头注释）。消费仓不受影响。
+#
+# 引擎来源（v0.15.0 解耦后）：
+# - 条件性消费仓安装（Install package 步）：pyproject.toml 守卫，Python 仓保留
+#   inline audit_tools 契约（memory-* scripts），非 Python 仓跳过
+# - 独立引擎安装步（Install engine）：pip install git+https://...infraro-core.git@<ref>
+#   ref 解析链：inputs.engine_ref || job.workflow_sha || github.sha
+#   （job.workflow_sha = 定义当前 job 的 workflow 文件 commit；reusable 场景 =
+#   caller uses 解析出的 reusable 文件 commit；直触场景 = 本仓 commit）
+# - provenance 断言步：importlib.metadata 版本 + direct_url.json vcs_info.commit_id
+#   （PEP 610 键名）40-hex 强比对，堵 pip 同版本静默跳过
+#
+# 弃用属性教训（防回归，三轮审查定案）：
+# - github.action_ref：仅定义于 step 执行 action，reusable 场景未文档化（v1 教训）
+# - github.job_workflow_sha：不存在的属性（文档 bug 遗留、OIDC claim only、恒空串；
+#   actions/runner#2417 GitHub 员工定论 + 2026-04-23 Actions Team 官宣四属性表）
+# - github.ref_name 兜底：workflow_call 下 = caller 分支名 → 静默漂移，禁止（v1 教训）
+
+name: Evolution Heartbeat Reusable
+
+on:
+  workflow_call:
+    inputs:
+      engine_ref:
+        required: false
+        type: string
+        default: ''
+        description: 'infra-core ref (tag/branch/SHA); default = this workflow file commit (job.workflow_sha)'
+      # 消费仓扫描器 thin caller 文件名（r38 consumer-template-reconciliation）。
+      # 引擎默认按契约名 evolution-scan.yml 探活/自愈拉起；消费仓文件名不同
+      # （且引擎 ≥ 本输入落地版本）时由此传入，覆盖引擎默认。
+      scanner_workflow:
+        required: false
+        type: string
+        default: 'evolution-scan.yml'
+        description: 'Consumer scanner thin-caller filename probed by heartbeat liveness / self-heal dispatch (default = engine contract name)'
+      # Runner specification for this job (INFRA-692).
+      # 兼容性：引擎自用默认 ubuntu-latest（hosted 无自建 runner 限制）；
+      # 消费仓双栈传 self-hosted 重负载槽。
+      runner:
+        required: false
+        type: string
+        default: '"ubuntu-latest"'
+        description: 'Runner label (ubuntu-latest for hosted / self-hosted for consumer)'
+    # Snake-only 声明（SNAKE-CONVERGENCE）：统一采用 snake_case 键名，
+    # 消除 hyphen 变体过渡形态，保持接口简洁。
+    secrets:
+      dispatch_token:
+        required: true
+        description: PAT (hdot123) for issue/label writes and self-heal dispatch
+  workflow_dispatch: {}
+  # INFRA-717 引擎仓自扫心跳定时面（见文件头注释）。与消费仓 caller 同窗
+  # （每 2h 一次），分钟位避开整点高峰（INFRA-578），与 scan 的 17,47 错开
+  # 并沿用消费仓 47 分位惯例。重复 tick 无害（自愈性质，幂等去重）。
+  schedule:
+    - cron: '53 */2 * * *'
+
+
+# F4/INFRA-688: 显式最小权限基线——heartbeat job 已带 job 级声明；顶层基线
+# 兜底未来新增 job 忘记声明时回落到只读（而非仓库默认权限）。
+permissions:
+  contents: read
+
+
+jobs:
+  heartbeat:
+    runs-on: ${{ fromJSON(inputs.runner || '"ubuntu-latest"') }}
+    # 2026-09-19 governance（VAL-CORE-003）：job 级串行（cancel-in-progress false）。
+    # 同 evolution-scan.yml：顶层被 INFRA-626 禁令钉死，组名自命名空间前缀 +
+    # repository_id 分仓（per-repo 组）。自扫心跳每 2h 一次且幂等（stale 探活 +
+    # 自愈 dispatch），串行不取消；前缀确保与任何 caller 顶层组永不同组（job 级
+    # 组与顶层组撞名同样触发自死锁）。
+    concurrency:
+      group: evolution-heartbeat-reusable-${{ github.repository_id }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: Create per-run venv (isolation from runner site-packages)
+        run: |
+          set -euo pipefail
+          python3.12 -m venv "$RUNNER_TEMP/venv"
+          echo "$RUNNER_TEMP/venv/bin" >> "$GITHUB_PATH"
+      - name: Install package
+        run: |
+          set -euo pipefail
+          if [ -f pyproject.toml ]; then
+            pip install -e .
+          else
+            echo "no pyproject.toml, skip consumer install"
+          fi
+      - name: Install engine (same commit as this reusable workflow)
+        env:
+          ENGINE_REF: ${{ inputs.engine_ref || job.workflow_sha || github.sha }}
+        run: |
+          set -euo pipefail
+          test -n "$ENGINE_REF"
+          if [[ ! "$ENGINE_REF" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::warning::non-SHA engine ref (${ENGINE_REF})"
+          fi
+          echo "ENGINE_REF=${ENGINE_REF} job.workflow_sha=${{ job.workflow_sha }} github.sha=${{ github.sha }}"
+          pip install "git+https://github.com/hdot123/infraro-core-mirror.git@${ENGINE_REF}"
+      - name: Assert engine version and provenance
+        env:
+          ENGINE_REF: ${{ inputs.engine_ref || job.workflow_sha || github.sha }}
+        run: |
+          python - <<'PY'
+          import importlib.metadata as m, json, os
+          d = m.distribution("infra-core")
+          print("infra-core", d.version)
+          du = json.loads(d.read_text("direct_url.json") or "{}")
+          vi = du.get("vcs_info") or {}
+          commit = vi.get("commit_id", "")
+          print("engine commit", commit)
+          ref = os.environ["ENGINE_REF"]
+          if len(ref) == 40 and ref.lower() != commit.lower():
+              raise SystemExit(f"installed engine commit {commit} != requested {ref}")
+          PY
+      - name: Ensure labels exist
+        env:
+          GH_TOKEN: ${{ secrets.dispatch_token }}
+        run: |
+          set -euo pipefail
+          # INFRA-601: 显式仓库上下文，免疫 runner insteadOf 镜像重写
+          gh --repo "$GITHUB_REPOSITORY" label create "evolution-heartbeat" --color D93F0B --description "Evolution heartbeat alert" --force || true
+      - name: Run heartbeat check
+        run: python -m infra_core.engine.evolution_heartbeat
+        env:
+          GH_TOKEN: ${{ secrets.dispatch_token }}
+          # P1-A: Prevent module poisoning — blocks automatic insertion of scripts/ into sys.path.
+          PYTHONSAFEPATH: '1'
+          # r38: 消费仓扫描器文件名覆盖（默认引擎契约名 evolution-scan.yml）。
+          EVOLUTION_SCANNER_WORKFLOW: ${{ inputs.scanner_workflow }}
+# 并发治理归属 caller：reusable 本体禁止携带 concurrency（同组名自死锁陷阱，
+# 2026-08-29 memory #1071 切换首 tick 实测）。per-repo 串行化由 caller
+# 顶层 concurrency 提供。

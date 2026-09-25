@@ -1,0 +1,137 @@
+# Branch Cleanup thin caller（消费仓模板）
+# 复制后保持 name: Branch Cleanup（auto-merge / workflow_run 消费方依赖该名）。
+# 双触发面保留：schedule 全量清扫 + pull_request closed 即时模式。
+
+name: Branch Cleanup
+
+on:
+  schedule:
+    - cron: '0 * * * *'
+  pull_request:
+    types: [closed]
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Cleanup mode: scheduled (sweep all) or immediate (specific branch)'
+        required: true
+        default: 'scheduled'
+        type: choice
+        options:
+          - scheduled
+          - immediate
+      branch:
+        description: 'Branch to clean (required for immediate mode)'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: read
+
+concurrency:
+  group: branch-cleanup
+  cancel-in-progress: false
+
+jobs:
+  # ── Job 0: 引擎消费授权门（m6-engine-authorization-gate）──
+  # 判定：本仓 repo variable ENGINE_CONSUMERS 含 authorized 令牌即放行；
+  # 引擎仓 hdot123/infraro-core 自身豁免。未授权 → fail-loud（下游 job 因
+  # needs 不启动）。凭证面：GITHUB_TOKEN 只读 actions:read，不消费 PAT。
+  # 秒级 job，不延长管线。
+  authorization-gate:
+    name: authorization-gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    permissions:
+      actions: read
+    steps:
+      - name: Verify engine consumer authorization
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.event.repository.full_name || github.repository }}
+          VARS_VALUE: ${{ vars.ENGINE_CONSUMERS || '' }}
+        run: |
+          set -euo pipefail
+
+          # 引擎授权门（engine authorization gate）——消费仓未授权时在管线入口
+          # fail-loud，不静默跳过。判定链：
+          #   ① 引擎仓自身豁免（默认 hdot123/infraro-core）
+          #   ② 优先用 vars 上下文值（caller 仓 repo variable，零权限、零 API 调用）
+          #   ③ 回退 gh api 读 repo variable（需 token 具备 Variables 读权限；
+          #      GITHUB_TOKEN 实测无该权限 → 403，故仅作回退/诊断路径）
+          #   ④ 未授权 / 读取失败 → 失败（fail-closed，不静默放行）
+          REPO="${REPO:-${GITHUB_REPOSITORY:-}}"
+          VARS_VALUE="${VARS_VALUE:-}"
+          VARIABLE_NAME="${ENGINE_AUTHORIZATION_VARIABLE:-ENGINE_CONSUMERS}"
+          AUTHORIZED_TOKEN="${ENGINE_AUTHORIZATION_TOKEN:-authorized}"
+          EXEMPT_REPOS="${ENGINE_AUTHORIZATION_EXEMPT_REPOS:-hdot123/infraro-core}"
+          ALERT="未授权消费引擎，走授权流程"
+
+          if [ -z "${REPO}" ]; then
+            echo "::error::${ALERT}：无法解析本仓 full_name（REPO / GITHUB_REPOSITORY 均为空）"
+            exit 1
+          fi
+
+          for exempt in ${EXEMPT_REPOS}; do
+            if [ "${REPO}" = "${exempt}" ]; then
+              echo "Authorization gate: ${REPO} 是引擎仓自身，豁免授权检查（exempt）"
+              exit 0
+            fi
+          done
+
+          matches_token() {
+            IFS=',' read -r -a TOKENS <<<"$1" || true
+            for token in "${TOKENS[@]:-}"; do
+              if [ "$(printf '%s' "${token}" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')" = "${AUTHORIZED_TOKEN}" ]; then
+                return 0
+              fi
+            done
+            return 1
+          }
+
+          if matches_token "${VARS_VALUE}"; then
+            echo "Authorization gate: ${REPO} authorized（${VARIABLE_NAME}=${VARS_VALUE} @vars）"
+            exit 0
+          fi
+
+          RAW="$(mktemp)"
+          rc=0
+          gh api "repos/${REPO}/actions/variables/${VARIABLE_NAME}" >"${RAW}" 2>&1 || rc=$?
+          if [ "${rc}" -eq 0 ]; then
+            VALUE="$(jq -r '.value // ""' <"${RAW}")"
+            rm -f "${RAW}"
+            if matches_token "${VALUE}"; then
+              echo "Authorization gate: ${REPO} authorized（${VARIABLE_NAME}=${VALUE} @api）"
+              exit 0
+            fi
+            echo "::error::${ALERT}：${REPO} 的 ${VARIABLE_NAME} 当前值为 '${VALUE}'，未包含授权令牌 '${AUTHORIZED_TOKEN}'"
+            exit 1
+          fi
+
+          if grep -q "404" "${RAW}"; then
+            echo "::error::${ALERT}：${REPO} 未设置 repo variable ${VARIABLE_NAME}（vars 上下文值亦为空；授权四步：variable → PAT → runner → 6 阶段验收）"
+          else
+            echo "::error::${ALERT}：${REPO} 授权状态不可读（vars 上下文值为空，rc=${rc}）：$(head -c 400 "${RAW}")"
+          fi
+          rm -f "${RAW}"
+          exit 1
+
+  cleanup:
+    needs: authorization-gate
+    name: cleanup
+    runs-on: [self-hosted, pve-linux]
+    steps:
+      - name: Branch Cleanup
+        uses: hdot123/infraro-core/actions/branch-cleanup@3695445b1d8df8997de35d39256ffe596d229c8c
+        with:
+          mode: ${{ github.event_name == 'workflow_dispatch' && inputs.mode || (github.event_name == 'pull_request' && 'immediate' || 'scheduled') }}
+          trigger-branch: ${{ github.event_name == 'workflow_dispatch' && inputs.branch || github.event.pull_request.head.ref || '' }}
+          # composite action 入参沿用其声明的连字符命名（R1(3) 统一面仅限
+          # workflow_call inputs；composite inputs 以 action.yml 声明为准）
+          dispatch-token: ${{ secrets.DISPATCH_TOKEN }}
+          branch-age-merged-hours: ${{ vars.BRANCH_AGE_MERGED_HOURS }}
+          branch-age-closed-hours: ${{ vars.BRANCH_AGE_CLOSED_HOURS }}
+          branch-age-orphan-hours: ${{ vars.BRANCH_AGE_ORPHAN_HOURS }}
+          linear-api-key: ${{ secrets.LINEAR_API_KEY }}
+          linear-project-id: ${{ vars.LINEAR_PROJECT_ID }}

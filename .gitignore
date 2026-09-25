@@ -1,0 +1,69 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+# 例外：webhook-scripts/lib/ 是 webhook 受管件（posthog.sh / op-mcp.sh），
+# 非构建产物——生产同步真源，必须入库（M5）。
+!webhook-scripts/lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Distribution
+*.tar.gz
+*.whl
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Memory artifacts (memory-hook 产物，公开仓禁止提交)
+/memory/
+project-map/
+INDEX.md
+NOW.md
+tests/.memory-anchor.md
+droid-wiki/
+AGENTS.md
+tools/
+
+# .evolution runtime state (live write targets, not for git tracking)
+.evolution/heartbeat.json
+.evolution/findings_over_time.json
+
+# CF Worker local state
+.wrangler/
+.dev.vars

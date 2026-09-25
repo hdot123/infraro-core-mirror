@@ -1,0 +1,41 @@
+
+- 「100% 核销」「零配置接入」类目标陈述：本文已以修正口径改写，不再作为验收基线（对应 §8 处修正 3/5）
+- Core↛Delivery 红线：**已从态三毕业**（本 mission feature 3 落地后入态一，测试强制）
+- v3 归类声明与文档修正（v3 步骤 2-3）属叙事层，无 CI 强制
+
+## 排除范围与后续 backlog
+
+本 mission（2026-09-22）明确排除，留待后续 mission：
+
+| 编号 | 项 | 级别 | 说明 |
+|---|---|---|---|
+| B1 | Evolution Governance 纳入合并阻断链 | P1 | 唯一 workflow 篡改防线但不在 required 链；需先解决 paths 过滤永不上报问题 |
+| — | watchdog 触发器恢复 | P1 | 涉及 workflow 结构变更（dispatch-only → schedule/workflow_run） |
+| P3 | quality-gate `per_page=100` 分页 | P3 | rerun 累积超 100 时超时红 |
+| P3 | `.evolution` 持久化 | P3 | actions/cache 驱逐后宽限重置（fail-safe 方向，可延后） |
+| B5 | Dependabot github-actions 生态与 governance 门禁互斥 | 产品决策 | Dependabot PR 必改 workflows → 必红，review 旁路形同虚设 |
+| — | F8 改 schedule 漂移审计 | P2 | 只读 token，不注入 pytest |
+| — | consumer-mixed / cli 预检面 / 消费仓接回 | — | v3 步骤 4；终局验收前置（零活消费仓） |
+
+## Truth Basis
+
+### Source Refs
+
+- 终审简报：`~/.factory/missions/7eedcdc4-98d7-4c44-9770-43022debbe28/reports/goal-adversarial-audit-final.md`（2026-09-22，三轮对抗审查收敛快照，自包含）
+- 三轮过程：GLM-5.3 立论 → DS4.1 红队 → GLM-5.3 申辩 + Fable 5.1 独立终审（全程只读、file:line 级证据）；同目录过程产物：`cross-audit.md` / `repo-inventory.md` / `pr-retrospective.md`
+- 本 mission 规划与落地记录：mission `3dfa75a1-b692-4426-9edf-5db7578339fa`（`architecture.md` §2-§4 证据基线、`library/*.md` 落地事实、`handoffs/*.json`）
+
+### Authority Refs
+
+- `memory/kb/decisions/architecture-layering-v3.md`（四层定稿，accepted；本文上位决策）
+- 用户 2026-09-22 裁定（AskUser 确认）：范围 = P0 决策文档 + 四个零成本防线项；决策文档走本地 KB 写入不进 git；liveness 连续 3 次 failure 判 stale；零红移序加 step-order 契约测试
+
+### Evidence Refs
+
+（file:line 索引，2026-09-22 对现树复核）
+
+- 三门 required（live）：`gh api repos/hdot123/infraro-core/rulesets/23079535`（enforcement=active、bypass_actors=[]、required=quality-gate/droid-review/substrate-gate-suite）；`quality-gate.yml:69-72`
+- Gate1 fail-closed：`substrate/gates/gate1_interface.py:266-270,300-306,327-332`；存量豁免 `substrate/gate0-exemptions.md:20-29`
+- liveness conclusion：`src/infra_core/engine/evolution_heartbeat.py:54,343-344,366-367`；旧语义锁定测试已修订（`tests/test_evolution_heartbeat.py`，76 passed）
+- 零红时序：`.github/workflows/ci.yml:548,563,577`；契约锁 `tests/test_ci_structure_contract.py`（TestCiOkStepOrder）
+- AST 锁：`tests/test_core_delivery_import_contract.py`；红线声明 `src/infra_core/engine/__init__.py:15-16`、`docs/architecture.md:20`
