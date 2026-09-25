@@ -1,0 +1,136 @@
+name: 'Branch Cleanup'
+description: 'Delete orphan branches with PR protection'
+
+inputs:
+  mode:
+    description: 'Cleanup mode: scheduled (hourly sweep) or immediate (PR-close)'
+    required: true
+    default: 'scheduled'
+  trigger-branch:
+    description: 'Branch to clean (immediate mode only, from PR close event)'
+    required: false
+    default: ''
+  dispatch-token:
+    description: 'GitHub token for branch deletion and issue management'
+    required: true
+  branch-age-merged-hours:
+    description: 'Hours threshold for merged-PR branches (empty → script defaults to 1)'
+    required: false
+    default: ''
+  branch-age-closed-hours:
+    description: 'Hours threshold for closed-PR branches (empty → script defaults to 4)'
+    required: false
+    default: ''
+  branch-age-orphan-hours:
+    description: 'Hours threshold for orphan branches (empty → script defaults to 24)'
+    required: false
+    default: ''
+  linear-api-key:
+    description: 'Linear API key for syncing issues to projects (empty = skip sync)'
+    required: false
+    default: ''
+  linear-project-id:
+    description: 'Linear project ID to sync issues to (empty = skip sync)'
+    required: false
+    default: ''
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Checkout repository
+      uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      with:
+        fetch-depth: 0
+
+    - name: Configure git
+      shell: bash
+      run: |
+        set -euo pipefail
+        git config user.name "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
+
+    - name: Delete orphan branches
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.dispatch-token }}
+        TRIGGER_BRANCH: ${{ inputs.trigger-branch }}
+        MODE: ${{ inputs.mode }}
+        # Tiered thresholds: MERGED PR 1h / CLOSED PR 4h / ORPHAN 24h
+        BRANCH_AGE_MERGED_HOURS: ${{ inputs.branch-age-merged-hours }}
+        BRANCH_AGE_CLOSED_HOURS: ${{ inputs.branch-age-closed-hours }}
+        BRANCH_AGE_ORPHAN_HOURS: ${{ inputs.branch-age-orphan-hours }}
+      run: |
+        set -euo pipefail
+        # Per-run scratch dir (INFRA-589): RUNNER_TEMP is isolated per job by
+        # GitHub Actions. Fixed /tmp paths previously leaked state across runs
+        # AND across repositories on shared self-hosted runners: a later run
+        # with PROTECTED_COUNT=0 skipped the list rewrite (and touch does not
+        # truncate), so branch_cleanup_issue.sh read the previous run's (or
+        # another repo's) protected list and created/kept phantom trackers.
+        WORK_DIR="${RUNNER_TEMP:-/tmp}/branch-cleanup-state"
+        mkdir -p "$WORK_DIR"
+        OUTPUT_FILE="$WORK_DIR/output.txt"
+        DELETED_FILE="$WORK_DIR/deleted_branches.txt"
+        PROTECTED_FILE="$WORK_DIR/protected_branches.txt"
+        # Always truncate the list files first: an empty list is a valid
+        # result and must overwrite any stale content.
+        : > "$DELETED_FILE"
+        : > "$PROTECTED_FILE"
+
+        if [ "$MODE" = "immediate" ]; then
+          # PR-close trigger: immediate cleanup of the merged branch only
+          bash $GITHUB_ACTION_PATH/branch_cleanup.sh --immediate "$TRIGGER_BRANCH" | tee "$OUTPUT_FILE"
+        else
+          # Scheduled trigger: sweep all orphan branches
+          bash $GITHUB_ACTION_PATH/branch_cleanup.sh --scheduled | tee "$OUTPUT_FILE"
+        fi
+
+        # Parse script output and set environment variables
+        DELETED_COUNT=$(grep '^deleted_count=' "$OUTPUT_FILE" | cut -d'=' -f2 || echo "0")
+        PROTECTED_COUNT=$(grep '^protected_count=' "$OUTPUT_FILE" | cut -d'=' -f2 || echo "0")
+
+        echo "deleted_count=${DELETED_COUNT:-0}" >> "$GITHUB_ENV"
+        echo "protected_count=${PROTECTED_COUNT:-0}" >> "$GITHUB_ENV"
+
+        # Extract deleted branch names for issue notification
+        if [ "${DELETED_COUNT:-0}" -gt 0 ]; then
+          awk '/^Deleted .* branch\(es\):$/,/^$/' "$OUTPUT_FILE" | grep -v '^Deleted' | grep -v '^$' > "$DELETED_FILE" || true
+        fi
+
+        # Extract protected branch names for issue notification
+        if [ "${PROTECTED_COUNT:-0}" -gt 0 ]; then
+          awk '/^Protected .* branch\(es\) with unmerged/,/^$/' "$OUTPUT_FILE" | grep -v '^Protected' | grep -v '^$' > "$PROTECTED_FILE" || true
+        fi
+
+    - name: Manage tracking issue (INFRA-385 dedup)
+      # Always run this step: when nothing was deleted/protected it closes
+      # the now-resolved tracking issue; otherwise it creates/updates the
+      # single tracking issue instead of opening one issue per run.
+      if: always()
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.dispatch-token }}
+        GH_REPO_KEY: ${{ github.repository }}
+        LINEAR_API_KEY: ${{ inputs.linear-api-key }}
+        LINEAR_PROJECT_ID: ${{ inputs.linear-project-id }}
+      run: |
+        set -euo pipefail
+        RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+        RUN_DATE=$(date -u '+%Y-%m-%d %H:%M UTC')
+
+        # Per-run scratch dir (INFRA-589): same isolation as the cleanup step;
+        # the list files were created (truncated) there at the start of this job.
+        WORK_DIR="${RUNNER_TEMP:-/tmp}/branch-cleanup-state"
+        DELETED_FILE="$WORK_DIR/deleted_branches.txt"
+        PROTECTED_FILE="$WORK_DIR/protected_branches.txt"
+
+        # Ensure list files exist (empty lists are valid). The cleanup step
+        # truncated them, but `if: always()` means this step can run even when
+        # that step failed before creating them.
+        touch "$DELETED_FILE" "$PROTECTED_FILE"
+
+        bash $GITHUB_ACTION_PATH/branch_cleanup_issue.sh \
+          --deleted "$DELETED_FILE" \
+          --protected "$PROTECTED_FILE" \
+          --run-url "$RUN_URL" \
+          --run-date "$RUN_DATE"

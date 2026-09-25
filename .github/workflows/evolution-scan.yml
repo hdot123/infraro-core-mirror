@@ -1,0 +1,181 @@
+# Evolution Scanner reusable workflow（M4 抽离，architecture.md §6）
+# scan 主体在本 reusable；消费仓定时触发面留在 thin caller（per-repo 定时，
+# 本期不中央化；caller 文件名必须保留 evolution-scan.yml——heartbeat 按
+# gh run list --workflow 文件名解析）。
+#
+# INFRA-717 引擎仓自扫 schedule：本仓既是引擎仓也是自扫消费仓，但无法建
+# 独立 thin caller——文件名被双契约钉死（消费仓 uses 按本文件路径引用 +
+# heartbeat SCANNER_WORKFLOW 按本文件名探活），独立 caller 文件的定时 run
+# 不计入探活会恒报 stale。故本文件自带 schedule（GitHub 语义：schedule 仅
+# 在 workflow 宿主仓生效，消费仓 caller 不受影响；本仓直触 run 的 secrets
+# 取本仓 org/repo secrets，2026-09-01 run 33506780661 已验证可用）。
+# 历史根因：M2 HOTFIX 因 red tick 禁用本仓 cron，M4 抽 reusable 后消费仓
+# 定时面落地但引擎仓自扫定时面漏建，全靠外部不规则 dispatch + heartbeat
+# 自愈兜底（INFRA-717 13h 空窗告警根因）。
+#
+# CRITICAL TOKEN STRATEGY:
+# 本 workflow 必须用 DISPATCH_TOKEN（PAT），不能用 GITHUB_TOKEN。
+# 原因：DISPATCH_TOKEN 属 @hdot123（OWNER），创建的 Issue author=hdot123，
+# 满足 CODEOWNERS 与 governance 检查。触发链：
+#   GitHub Issue (DISPATCH_TOKEN) → Linear 同步 → webhook（CF Worker）→ trigger-droid.sh
+#   → droid exec --tag linear-gateway → PR → CI → 合并
+#
+# 引擎来源（v0.15.0 解耦后）：
+# - 条件性消费仓安装（Install package 步）：pyproject.toml 守卫，Python 仓保留
+#   inline audit_tools 契约（memory-* scripts），非 Python 仓跳过
+# - 独立引擎安装步（Install engine）：pip install git+https://...infraro-core.git@<ref>
+#   ref 解析链：inputs.engine_ref || job.workflow_sha || github.sha
+#   （job.workflow_sha = 定义当前 job 的 workflow 文件 commit；reusable 场景 =
+#   caller uses 解析出的 reusable 文件 commit；直触场景 = 本仓 commit）
+# - provenance 断言步：importlib.metadata 版本 + direct_url.json vcs_info.commit_id
+#   （PEP 610 键名）40-hex 强比对，堵 pip 同版本静默跳过
+#
+# 弃用属性教训（防回归，三轮审查定案）：
+# - github.action_ref：仅定义于 step 执行 action，reusable 场景未文档化（v1 教训）
+# - github.job_workflow_sha：不存在的属性（文档 bug 遗留、OIDC claim only、恒空串；
+#   actions/runner#2417 GitHub 员工定论 + 2026-04-23 Actions Team 官宣四属性表）
+# - github.ref_name 兜底：workflow_call 下 = caller 分支名 → 静默漂移，禁止（v1 教训）
+
+name: Evolution Scan Reusable
+
+on:
+  workflow_call:
+    inputs:
+      engine_ref:
+        required: false
+        type: string
+        default: ''
+        description: 'infra-core ref (tag/branch/SHA); default = this workflow file commit (job.workflow_sha)'
+      # Runner specification for this job (INFRA-692).
+      # 兼容性：引擎自用默认 ubuntu-latest（hosted 无自建 runner 限制）；
+      # 消费仓双栈传 self-hosted 重负载槽。
+      runner:
+        required: false
+        type: string
+        default: '"ubuntu-latest"'
+        description: 'Runner label (ubuntu-latest for hosted / self-hosted for consumer)'
+    # Snake-only 声明（SNAKE-CONVERGENCE）：统一采用 snake_case 键名，
+    # 消除 hyphen 变体过渡形态，保持接口简洁。
+    secrets:
+      dispatch_token:
+        required: true
+        description: PAT (hdot123) for issue/label writes and self-heal dispatch
+      linear_api_key:
+        required: false
+        description: LINEAR_API_KEY for auto_close_resolved Linear state verification
+  workflow_dispatch: {}
+  # INFRA-717 引擎仓自扫定时面（本仓作为自扫消费仓的触发面，见文件头注释）。
+  # cron 与消费仓 caller 同窗（13,43 每 30 分钟双窗）；分钟位避开 :00/:30
+  # 高峰 load-shed 窗口（INFRA-578）。tick 幂等由引擎 tick-budget 吸收。
+  schedule:
+    - cron: '17,47 * * * *'
+
+
+# F4/INFRA-688: 显式最小权限基线——scan job 已带 job 级声明；顶层基线兜底
+# 未来新增 job 忘记声明时回落到只读（而非仓库默认权限）。
+permissions:
+  contents: read
+
+
+jobs:
+  scan:
+    runs-on: ${{ fromJSON(inputs.runner || '"ubuntu-latest"') }}
+    # 2026-09-19 governance（VAL-CORE-003）：job 级串行（cancel-in-progress false）。
+    # 顶层 concurrency 被 INFRA-626 禁令钉死（workflow_call reusable 顶层与 caller
+    # 顶层组撞名 = GitHub run 级自死锁秒取消，2026-08-29 memory #1071 实测），
+    # 故本块在 job 级。组名自命名空间（evolution-scan-reusable- 前缀）确保与
+    # caller 顶层组（消费仓契约名 evolution-scan 等）永不同组——job 级组与
+    # 顶层组同名组合同样触发自死锁（job「scan」先例，故前缀必异）。
+    # 消费仓 caller 场景：caller 首选进入本组，串行化同样成立（per-repo 组，
+    # repository_id 分仓），与其自身顶层组（若有）名目不同、无死锁面。
+    # 语义：自扫定时 tick 每 30 分钟一次，串行不取消（tick-budget 幂等吸收
+    # 重复，防相邻 tick 排队堆积时被取消截断 findings 历史）。
+    concurrency:
+      group: evolution-scan-reusable-${{ github.repository_id }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: Create per-run venv (isolation from runner site-packages)
+        run: |
+          set -euo pipefail
+          python3.12 -m venv "$RUNNER_TEMP/venv"
+          echo "$RUNNER_TEMP/venv/bin" >> "$GITHUB_PATH"
+      - name: Install package
+        run: |
+          set -euo pipefail
+          if [ -f pyproject.toml ]; then
+            pip install -e .
+          else
+            echo "no pyproject.toml, skip consumer install"
+          fi
+      - name: Install engine (same commit as this reusable workflow)
+        env:
+          ENGINE_REF: ${{ inputs.engine_ref || job.workflow_sha || github.sha }}
+        run: |
+          set -euo pipefail
+          test -n "$ENGINE_REF"
+          if [[ ! "$ENGINE_REF" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::warning::non-SHA engine ref (${ENGINE_REF})"
+          fi
+          echo "ENGINE_REF=${ENGINE_REF} job.workflow_sha=${{ job.workflow_sha }} github.sha=${{ github.sha }}"
+          pip install "git+https://github.com/hdot123/infraro-core-mirror.git@${ENGINE_REF}"
+      - name: Assert engine version and provenance
+        env:
+          ENGINE_REF: ${{ inputs.engine_ref || job.workflow_sha || github.sha }}
+        run: |
+          python - <<'PY'
+          import importlib.metadata as m, json, os
+          d = m.distribution("infra-core")
+          print("infra-core", d.version)
+          du = json.loads(d.read_text("direct_url.json") or "{}")
+          vi = du.get("vcs_info") or {}
+          commit = vi.get("commit_id", "")
+          print("engine commit", commit)
+          ref = os.environ["ENGINE_REF"]
+          if len(ref) == 40 and ref.lower() != commit.lower():
+              raise SystemExit(f"installed engine commit {commit} != requested {ref}")
+          PY
+      # R1'-B 债3：原「error patterns 生成步」与「registry.jsonl 存在性校验步」
+      # 已删——前者扫 runner 本机 ~/.memory-core 索引（CI 上不存在，纯空转），
+      # 且 pack 工具同 tick 已以 --repo-root 运行 error-patterns
+      # （src/infra_core/packs/memory/pack.py），系重复动作；后者仅输出 warning，
+      # 无阻断价值。
+      - name: Cache evolution history
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            .evolution/findings_over_time.json
+            .evolution/heartbeat.json
+          key: evolution-history-${{ github.run_id }}
+          restore-keys: evolution-history-
+      - name: Ensure labels exist
+        env:
+          GH_TOKEN: ${{ secrets.dispatch_token }}
+        run: |
+          set -euo pipefail
+          # INFRA-601: 显式仓库上下文，免疫 runner insteadOf 镜像重写
+          gh --repo "$GITHUB_REPOSITORY" label create "evolution-found" --color FBCA04 --description "Evolution scanner finding" --force || true
+          gh --repo "$GITHUB_REPOSITORY" label create "evolution-isolated" --color B60205 --description "Stuck 3+ ticks" --force || true
+      - name: Run evolution scanner
+        run: python -m infra_core.engine.evolution_scanner
+        env:
+          GH_TOKEN: ${{ secrets.dispatch_token }}
+          # LINEAR_API_KEY enables Linear issue state verification in auto_close_resolved.
+          # Without it, the scanner cannot verify Linear terminal state and will
+          # fail-closed (block close) for Linear-linked issues to prevent churn.
+          LINEAR_API_KEY: ${{ secrets.linear_api_key }}
+          # P1-A: Prevent module poisoning — blocks automatic insertion of scripts/ into sys.path.
+          # The scanner explicitly re-adds its own directory via sys.path.insert.
+          PYTHONSAFEPATH: '1'
+          # R1'-B 债2（belt-and-braces）：审计目标仓显式注入——值 = GITHUB_REPOSITORY，
+          # 与 evolution_self_audit.py REPO_NAME 默认链同步，多消费仓 tick 不再
+          # 错仓审计 hdot123/memory。
+          EVOLUTION_AUDIT_REPO: ${{ github.repository }}
+# 并发治理归属 caller：reusable 本体禁止携带与 caller 同名的顶层 concurrency——
+# 实测（2026-08-29 memory #1071 切换首 tick）caller 顶层 group 与 callee
+# group 同名时 GitHub 判定自死锁并秒取消（"deadlock was detected for
+# concurrency group ... between a top level workflow and 'scan'"）。
+# per-repo 串行化由 caller 顶层 concurrency 提供。

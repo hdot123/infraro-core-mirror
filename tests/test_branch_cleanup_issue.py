@@ -1,0 +1,1164 @@
+"""Tests for scripts/branch_cleanup_issue.sh (INFRA-385 tracking-issue dedup).
+
+Contract under test:
+- at most ONE open branch-cleanup tracking issue exists at any time
+- same protected set  -> reuse silently (no new issue, no comment)
+- protected set grown -> update body + comment
+- protected set shrunk-> update body + comment; auto-close when empty
+- nothing actionable  -> close the tracking issue as resolved
+- pre-INFRA-385 duplicate open issues are closed pointing to the active one
+- VAL-NTF-001 (removed): protected-only runs with no open tracker now CREATE
+  a tracker (weekly pulse); existing tracker is updated in place as before
+"""
+
+from __future__ import annotations
+
+import json
+import subprocess
+from pathlib import Path
+
+import pytest
+
+pytestmark = pytest.mark.integration
+
+from tests.shellcheck_helpers import assert_shellcheck_clean
+
+
+def get_script_path() -> Path:
+    """Get path to branch_cleanup_issue.sh script."""
+    return (
+        Path(__file__).resolve().parent.parent
+        / "src"
+        / "infra_core"
+        / "shell"
+        / "branch_cleanup_issue.sh"
+    )
+
+
+class GhCall:
+    """A recorded gh CLI invocation."""
+
+    def __init__(self, args: list[str], stdin: str | None = None) -> None:
+        self.args = args
+        self.stdin = stdin
+
+
+class GhMockHarness:
+    """Mocks the gh CLI for branch_cleanup_issue.sh tests.
+
+    Simulates the repository state (open issues, issue bodies) and records
+    all gh invocations for assertions.
+    """
+
+    def __init__(
+        self,
+        tmp_path: Path,
+        issues: dict[int, str] | None = None,
+        env: dict[str, str] | None = None,
+        curl_responses: list[str] | None = None,
+    ) -> None:
+        """Args:
+        issues: mapping of issue number -> body for OPEN issues.
+        env: additional environment variables to pass to the script.
+        curl_responses: canned responses for the mock curl (consumed in order,
+            the last one repeats). Defaults to ``{}`` so no test touches the
+            real Linear API.
+        """
+        self.tmp_path = tmp_path
+        self.issues: dict[int, str] = dict(issues or {})
+        self.env = env or {}
+        self.calls: list[GhCall] = []
+        self.next_number = max(self.issues, default=100) + 1
+
+        mock_dir = tmp_path / "mock_bin"
+        mock_dir.mkdir(exist_ok=True)
+        # State shared with the mock script via files (simplest robust IPC)
+        self.state_file = tmp_path / "gh_state.json"
+        self.calls_file = tmp_path / "gh_calls.jsonl"
+        self.curl_calls_file = tmp_path / "curl_calls.jsonl"
+        self._write_state()
+        self.calls_file.write_text("")
+        self.curl_calls_file.write_text("")
+
+        mock_gh = mock_dir / "gh"
+        mock_gh.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, os, sys\n"
+            "args = sys.argv[1:]\n"
+            f"state_file = {str(self.state_file)!r}\n"
+            f"calls_file = {str(self.calls_file)!r}\n"
+            "with open(calls_file, 'a') as f:\n"
+            "    f.write(json.dumps({'args': args}) + '\\n')\n"
+            "state = json.load(open(state_file))\n"
+            "if args[:2] == ['search', 'issues']:\n"
+            "    query = ' '.join(a for a in args if not a.startswith('-'))\n"
+            "    if 'branch-cleanup-tracker' in query:\n"
+            "        marker_hits = [{'repository': 'example-org/memory', 'url': f'https://github.com/example-org/memory/issues/{n}'} for n, b in state['issues'].items() if 'branch-cleanup-tracker' in b]\n"
+            "        print(json.dumps(marker_hits))\n"
+            "    else:\n"
+            "        print(json.dumps([{'url': f'https://github.com/hdot123/memory/issues/{n}'} for n in sorted(state['issues'], reverse=True)]))\n"
+            "    sys.exit(0)\n"
+            "if args[:2] == ['issue', 'view']:\n"
+            "    n = args[2]\n"
+            "    if n not in [str(k) for k in state['issues']]:\n"
+            "        sys.stderr.write('not found\\n'); sys.exit(1)\n"
+            "    payload = {'body': state['issues'][str(n)]}\n"
+            "    if '--jq' in args:\n"
+            "        jq_expr = args[args.index('--jq') + 1]\n"
+            "        if jq_expr == '.body':\n"
+            "            print(payload['body']); sys.exit(0)\n"
+            "        sys.stderr.write(f'unmocked jq: {jq_expr}\\n'); sys.exit(1)\n"
+            "    print(json.dumps(payload)); sys.exit(0)\n"
+            "if args[:2] == ['issue', 'close']:\n"
+            "    n = args[2]\n"
+            "    state['issues'].pop(str(n), None)\n"
+            "    json.dump(state, open(state_file, 'w'))\n"
+            "    print(f'Closed issue #{n}')\n"
+            "    sys.exit(0)\n"
+            "if args[:2] == ['issue', 'create']:\n"
+            "    n = state['next']\n"
+            "    state['next'] += 1\n"
+            "    body_idx = args.index('--body') + 1\n"
+            "    state['issues'][str(n)] = args[body_idx]\n"
+            "    json.dump(state, open(state_file, 'w'))\n"
+            "    print(f'https://github.com/hdot123/memory/issues/{n}')\n"
+            "    sys.exit(0)\n"
+            "if args[:2] == ['issue', 'edit']:\n"
+            "    n = args[2]\n"
+            "    body_idx = args.index('--body') + 1\n"
+            "    state['issues'][str(n)] = args[body_idx]\n"
+            "    json.dump(state, open(state_file, 'w'))\n"
+            "    print(f'Updated issue #{n}')\n"
+            "    sys.exit(0)\n"
+            "if args[:2] == ['issue', 'comment']:\n"
+            "    n = args[2]\n"
+            "    body_idx = args.index('--body') + 1\n"
+            "    print(f'Commented on issue #{n}')\n"
+            "    sys.exit(0)\n"
+            "if args[:2] == ['label', 'create']:\n"
+            "    sys.exit(0)\n"
+            "sys.stderr.write(f'unmocked: {args}\\n'); sys.exit(1)\n"
+        )
+        mock_gh.chmod(0o755)
+        self.mock_bin = mock_dir
+
+        # Mock curl: records every invocation and serves canned responses
+        # (round-robin with last-repeats), keeping tests fully offline.
+        self.curl_responses_file = tmp_path / "curl_responses.json"
+        self.curl_counter_file = tmp_path / "curl_counter.txt"
+        self.curl_responses_file.write_text(
+            json.dumps(curl_responses if curl_responses is not None else ["{}"])
+        )
+        self.curl_counter_file.write_text("0")
+        mock_curl = mock_dir / "curl"
+        mock_curl.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, sys\n"
+            "args = sys.argv[1:]\n"
+            "data = args[args.index('-d') + 1] if '-d' in args else ''\n"
+            "with open(" + repr(str(self.curl_calls_file)) + ", 'a') as f:\n"
+            "    f.write(json.dumps({'args': args, 'data': data}) + '\\n')\n"
+            "responses = json.load(open(" + repr(str(self.curl_responses_file)) + "))\n"
+            "i = int(open(" + repr(str(self.curl_counter_file)) + ").read() or 0)\n"
+            "open(" + repr(str(self.curl_counter_file)) + ", 'w').write(str(i + 1))\n"
+            "print(responses[min(i, len(responses) - 1)])\n"
+        )
+        mock_curl.chmod(0o755)
+
+    def _write_state(self) -> None:
+        self.state_file.write_text(json.dumps({"issues": self.issues, "next": self.next_number}))
+
+    def read_calls(self) -> list[GhCall]:
+        calls = []
+        for line in self.calls_file.read_text().splitlines():
+            if line.strip():
+                data = json.loads(line)
+                calls.append(GhCall(data["args"]))
+        return calls
+
+    def read_curl_calls(self) -> list[dict]:
+        """Return recorded curl invocations as {"args": [...], "data": str}."""
+        calls = []
+        for line in self.curl_calls_file.read_text().splitlines():
+            if line.strip():
+                calls.append(json.loads(line))
+        return calls
+
+    def curl_calls_matching(self, substring: str) -> list[dict]:
+        """Return curl calls whose request payload contains substring."""
+        return [c for c in self.read_curl_calls() if substring in c["data"]]
+
+    def run_script(
+        self,
+        deleted: list[str] | None = None,
+        protected: list[str] | None = None,
+        run_url: str = "https://github.com/hdot123/memory/actions/runs/1",
+        run_date: str = "2026-08-18 00:00 UTC",
+    ) -> tuple[int, str, str]:
+        deleted_file = self.tmp_path / "deleted_branches.txt"
+        protected_file = self.tmp_path / "protected_branches.txt"
+        deleted_file.write_text("".join(f"{b}\n" for b in (deleted or [])))
+        protected_file.write_text("".join(f"{b}\n" for b in (protected or [])))
+
+        import os
+
+        env = os.environ.copy()
+        env["PATH"] = f"{self.mock_bin}:{env['PATH']}"
+        env["GH_REPO_KEY"] = "example-org/memory"
+        # Actions runner 默认注入 GITHUB_REPOSITORY；"env 未设置"分支的测试前提
+        # 要求子进程不含该变量（本地无此 env 故此前本地全绿、runner 必红）。
+        # 显式剥离后再应用 self.env——测试显式传入的 GITHUB_REPOSITORY 仍然生效。
+        env.pop("GITHUB_REPOSITORY", None)
+        # Apply any additional env vars passed to __init__
+        env.update(self.env)
+
+        result = subprocess.run(
+            [
+                "bash",
+                str(get_script_path()),
+                "--deleted",
+                str(deleted_file),
+                "--protected",
+                str(protected_file),
+                "--run-url",
+                run_url,
+                "--run-date",
+                run_date,
+            ],
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        return result.returncode, result.stdout, result.stderr
+
+    def open_issue_numbers(self) -> list[str]:
+        state = json.loads(self.state_file.read_text())
+        return sorted(state["issues"].keys())
+
+
+def tracker_body(branches: list[str]) -> str:
+    """Build a tracker-format issue body listing protected branches.
+
+    `branches` items are full entry strings as emitted by branch_cleanup.sh's
+    PROTECTED_BRANCHES array, e.g. "feat/x (2 unique commits)".
+    """
+    lines = [
+        "## Automated Branch Cleanup (tracking)",
+        "",
+        "**Protected branches:** " + str(len(branches)),
+        "### 🛡️ Protected branches (unmerged unique commits)",
+        "",
+    ]
+    for b in branches:
+        lines.append(f"- `{b}`")
+    lines.append("---")
+    lines.append("<!-- branch-cleanup-tracker -->")
+    return "\n".join(lines)
+
+
+def legacy_body(branches: list[str]) -> str:
+    """Pre-INFRA-385 issue body (no tracker marker)."""
+    lines = [
+        "## Automated Branch Cleanup",
+        "",
+        "### 🛡️ Protected branches (unmerged unique commits)",
+        "",
+    ]
+    for b in branches:
+        lines.append(f"- `{b} ({len(b)} unique commits)`")
+    return "\n".join(lines)
+
+
+def calls_matching(calls: list[GhCall], prefix: list[str]) -> list[GhCall]:
+    return [c for c in calls if c.args[: len(prefix)] == prefix]
+
+
+# ============================================================================
+# VAL-BCI-001: unchanged protected set -> silent reuse, no new issue/comment
+# ============================================================================
+def test_duplicate_run_same_protected_set_silent(tmp_path: Path):
+    """INFRA-385 core scenario: same protected branches on the next run must
+    NOT create a new issue and NOT post a duplicate comment."""
+    harness = GhMockHarness(
+        tmp_path,
+        issues={781: tracker_body(["fix/pr-ref-consistency-gate (4 unique commits)"])},
+    )
+
+    exit_code, stdout, _ = harness.run_script(
+        protected=["fix/pr-ref-consistency-gate (4 unique commits)"]
+    )
+
+    assert exit_code == 0, stdout
+    assert "issue_action=reused-silent" in stdout
+    calls = harness.read_calls()
+    assert calls_matching(calls, ["issue", "create"]) == [], "must NOT create a new issue"
+    assert calls_matching(calls, ["issue", "comment"]) == [], "must NOT comment on duplicate run"
+    assert calls_matching(calls, ["issue", "edit"]) == [], "must NOT edit body on duplicate run"
+    assert harness.open_issue_numbers() == ["781"], "original issue stays open"
+
+
+# ============================================================================
+# VAL-BCI-002: new protected branch -> single tracking issue updated in place
+# ============================================================================
+def test_new_protected_branch_updates_tracker(tmp_path: Path):
+    """A newly protected branch updates the existing tracking issue body and
+    posts a comment; no second issue is created."""
+    harness = GhMockHarness(
+        tmp_path,
+        issues={781: tracker_body(["fix/pr-ref-consistency-gate (4 unique commits)"])},
+    )
+
+    exit_code, stdout, _ = harness.run_script(
+        protected=[
+            "fix/pr-ref-consistency-gate (4 unique commits)",
+            "feat/other-branch (2 unique commits)",
+        ]
+    )
+
+    assert exit_code == 0, stdout
+    assert "issue_action=updated" in stdout
+    calls = harness.read_calls()
+    assert calls_matching(calls, ["issue", "create"]) == [], "must NOT create a new issue"
+    edits = calls_matching(calls, ["issue", "edit"])
+    assert len(edits) == 1, "tracker body must be updated exactly once"
+    assert edits[0].args[2] == "781"
+    comments = calls_matching(calls, ["issue", "comment"])
+    assert len(comments) == 1, "state change must be commented exactly once"
+    assert harness.open_issue_numbers() == ["781"]
+
+
+# ============================================================================
+# VAL-BCI-003: protected set emptied -> tracking issue auto-closed
+# ============================================================================
+def test_all_resolved_closes_tracker(tmp_path: Path):
+    """When the run reports nothing actionable, the tracking issue is closed
+    as resolved with an explanatory comment."""
+    harness = GhMockHarness(
+        tmp_path,
+        issues={781: tracker_body(["fix/pr-ref-consistency-gate (4 unique commits)"])},
+    )
+
+    exit_code, stdout, _ = harness.run_script()
+
+    assert exit_code == 0, stdout
+    assert "issue_action=closed" in stdout
+    calls = harness.read_calls()
+    closes = calls_matching(calls, ["issue", "close"])
+    assert len(closes) == 1 and closes[0].args[2] == "781"
+    assert harness.open_issue_numbers() == [], "tracker must be closed"
+
+
+# ============================================================================
+# VAL-BCI-004: no tracker + nothing actionable -> no issue created
+# ============================================================================
+def test_no_actionable_no_tracker_creates_nothing(tmp_path: Path):
+    """A clean run with no existing tracking issue must not create one."""
+    harness = GhMockHarness(tmp_path)
+
+    exit_code, stdout, _ = harness.run_script()
+
+    assert exit_code == 0, stdout
+    assert "issue_action=none" in stdout
+    calls = harness.read_calls()
+    assert calls_matching(calls, ["issue", "create"]) == []
+    assert calls_matching(calls, ["issue", "close"]) == []
+    assert harness.open_issue_numbers() == []
+
+
+# ============================================================================
+# VAL-BCI-005: no tracker + deletion -> creates the single tracker
+# ============================================================================
+def test_first_deletion_creates_single_tracker(tmp_path: Path):
+    """First-ever deletion event creates exactly one tracking issue with
+    the marker and labels."""
+    harness = GhMockHarness(tmp_path)
+
+    exit_code, stdout, _ = harness.run_script(deleted=["fix/pr-ref-consistency-gate"])
+
+    assert exit_code == 0, stdout
+    assert "issue_action=created" in stdout
+    calls = harness.read_calls()
+    creates = calls_matching(calls, ["issue", "create"])
+    assert len(creates) == 1, "exactly one tracking issue must be created"
+    labels_idx = creates[0].args.index("--label") + 1
+    assert creates[0].args[labels_idx] == "automation,branch-cleanup"
+    assert harness.open_issue_numbers() == ["101"]
+
+
+# ============================================================================
+# VAL-BCI-006: shrunk protected set -> update + comment, stays open
+# ============================================================================
+def test_shrunk_protected_set_updates_and_keeps_open(tmp_path: Path):
+    """One of two tracked branches disappears: body updated, comment posted,
+    issue stays open because one branch is still protected."""
+    harness = GhMockHarness(
+        tmp_path,
+        issues={
+            781: tracker_body(
+                [
+                    "fix/pr-ref-consistency-gate (4 unique commits)",
+                    "feat/other (2 unique commits)",
+                ]
+            )
+        },
+    )
+
+    exit_code, stdout, _ = harness.run_script(
+        protected=["fix/pr-ref-consistency-gate (4 unique commits)"]
+    )
+
+    assert exit_code == 0, stdout
+    assert "issue_action=updated" in stdout
+    calls = harness.read_calls()
+    assert calls_matching(calls, ["issue", "create"]) == []
+    assert len(calls_matching(calls, ["issue", "comment"])) == 1
+    assert harness.open_issue_numbers() == ["781"], "still-protection -> stays open"
+
+
+# ============================================================================
+# VAL-BCI-007: legacy duplicate issues are closed pointing to the tracker
+# ============================================================================
+def test_legacy_duplicates_closed_pointing_to_tracker(tmp_path: Path):
+    """INFRA-385 leftovers: an open legacy issue (same protected set, no
+    marker) is closed with a pointer comment to the active tracker."""
+    harness = GhMockHarness(
+        tmp_path,
+        issues={
+            781: tracker_body(["fix/pr-ref-consistency-gate (4 unique commits)"]),
+            774: legacy_body(["fix/pr-ref-consistency-gate (4 unique commits)"]),
+        },
+    )
+
+    exit_code, stdout, _ = harness.run_script(
+        protected=["fix/pr-ref-consistency-gate (4 unique commits)"]
+    )
+
+    assert exit_code == 0, stdout
+    calls = harness.read_calls()
+    closes = calls_matching(calls, ["issue", "close"])
+    assert len(closes) == 1 and closes[0].args[2] == "774", "legacy duplicate must be closed"
+    assert harness.open_issue_numbers() == ["781"], "active tracker stays open"
+
+
+# ============================================================================
+# VAL-BCI-008: deletions-only run updates tracker and comments
+# ============================================================================
+def test_deletions_only_run_reports_on_tracker(tmp_path: Path):
+    """Branches were deleted and nothing protected: the tracker body is
+    updated and a comment reports the deletions (issue stays open only if
+    it existed; here none exists, so one is created)."""
+    harness = GhMockHarness(tmp_path)
+
+    exit_code, stdout, _ = harness.run_script(deleted=["feat/gone-branch"])
+
+    assert exit_code == 0, stdout
+    assert "issue_action=created" in stdout
+    calls = harness.read_calls()
+    creates = calls_matching(calls, ["issue", "create"])
+    assert len(creates) == 1
+    body_idx = creates[0].args.index("--body") + 1
+    assert "feat/gone-branch" in creates[0].args[body_idx]
+
+
+# ============================================================================
+# VAL-BCI-009: deletions with unchanged protected set still comments
+# ============================================================================
+def test_deletions_with_same_protected_set_comments(tmp_path: Path):
+    """Unchanged protected set PLUS deletions is a reportable state change:
+    body updated and comment posted (not silent)."""
+    harness = GhMockHarness(
+        tmp_path,
+        issues={781: tracker_body(["fix/pr-ref-consistency-gate (4 unique commits)"])},
+    )
+
+    exit_code, stdout, _ = harness.run_script(
+        deleted=["feat/gone-branch"],
+        protected=["fix/pr-ref-consistency-gate (4 unique commits)"],
+    )
+
+    assert exit_code == 0, stdout
+    assert "issue_action=updated" in stdout
+    calls = harness.read_calls()
+    assert calls_matching(calls, ["issue", "create"]) == []
+    assert len(calls_matching(calls, ["issue", "comment"])) == 1
+
+
+# ============================================================================
+# VAL-BCI-010: shellcheck clean
+# ============================================================================
+def test_shellcheck_clean():
+    """shellcheck scripts/branch_cleanup_issue.sh exits 0."""
+    assert_shellcheck_clean(get_script_path())
+
+
+# ============================================================================
+# VAL-NTF-001a (reversed): protected-only run with no tracker creates one
+# ============================================================================
+def test_protected_only_no_tracker_creates_tracker(tmp_path: Path):
+    """When deleted_count == 0, protected_count > 0, and no tracker exists,
+    the script must CREATE a new tracking issue. This is the weekly pulse
+    behavior: protected-only runs now create a tracker so residual branches
+    are visible to humans.
+
+    Assertions:
+    - exit code 0
+    - stdout contains 'issue_action=created'
+    - exactly 1 gh issue create call with --label 'automation,branch-cleanup'
+    - issue body contains the protected branch name
+    - open_issue_numbers() has exactly 1 issue
+    """
+    harness = GhMockHarness(tmp_path)
+
+    protected_branch = "fix/pr-ref-consistency-gate (4 unique commits)"
+    exit_code, stdout, _ = harness.run_script(protected=[protected_branch])
+
+    assert exit_code == 0, f"Script must exit successfully, got {exit_code}. stdout: {stdout}"
+    assert "issue_action=created" in stdout, (
+        f"stdout must contain 'issue_action=created', got: {stdout}"
+    )
+
+    calls = harness.read_calls()
+    create_calls = calls_matching(calls, ["issue", "create"])
+    assert len(create_calls) == 1, (
+        f"Expected exactly 1 'gh issue create' call, got {len(create_calls)}. Create calls: {create_calls}"
+    )
+
+    # Verify --label value is 'automation,branch-cleanup'
+    create_call = create_calls[0]
+    label_idx = None
+    for i, arg in enumerate(create_call.args):
+        if arg == "--label":
+            label_idx = i + 1
+            break
+    assert label_idx is not None, f"--label not found in create call args: {create_call.args}"
+    assert create_call.args[label_idx] == "automation,branch-cleanup", (
+        f"--label must be 'automation,branch-cleanup', got '{create_call.args[label_idx]}'"
+    )
+
+    # Verify --body contains the protected branch name
+    body_idx = None
+    for i, arg in enumerate(create_call.args):
+        if arg == "--body":
+            body_idx = i + 1
+            break
+    assert body_idx is not None, f"--body not found in create call args: {create_call.args}"
+    issue_body = create_call.args[body_idx]
+    assert protected_branch in issue_body, (
+        f"Issue body must contain protected branch name '{protected_branch}'. Body: {issue_body}"
+    )
+
+    # Verify exactly 1 open issue exists
+    open_issues = harness.open_issue_numbers()
+    assert len(open_issues) == 1, (
+        f"Expected exactly 1 open issue, got {len(open_issues)}: {open_issues}"
+    )
+
+
+# ============================================================================
+# VAL-NTF-001b: protected-only run with existing tracker updates but doesn't create
+# ============================================================================
+def test_protected_only_with_tracker_updates_no_create(tmp_path: Path):
+    """When deleted_count == 0 and a tracker exists, protected-only run may
+    update the tracker (if protected set changed) but must NOT create a new issue."""
+    harness = GhMockHarness(
+        tmp_path,
+        issues={781: tracker_body(["fix/pr-ref-consistency-gate (4 unique commits)"])},
+    )
+
+    exit_code, stdout, _ = harness.run_script(
+        protected=[
+            "fix/pr-ref-consistency-gate (4 unique commits)",
+            "feat/new-protected (2 unique commits)",  # new protected branch
+        ]
+    )
+
+    assert exit_code == 0, stdout
+    calls = harness.read_calls()
+    assert calls_matching(calls, ["issue", "create"]) == [], (
+        "protected-only run must NOT create an issue even if tracker updated"
+    )
+    # May update or comment on existing tracker, but not create new one
+    assert harness.open_issue_numbers() == ["781"], "existing tracker remains"
+
+
+# ============================================================================
+# VAL-NTF-001c: deleted_count > 0 creates tracker (existing behavior)
+# ============================================================================
+def test_deletions_create_tracker(tmp_path: Path):
+    """When deleted_count > 0 and no tracker exists, a new tracker is created.
+    This is the existing behavior from VAL-BCI-008, verified here for completeness."""
+    harness = GhMockHarness(tmp_path)
+
+    exit_code, stdout, _ = harness.run_script(deleted=["feat/gone-branch"])
+
+    assert exit_code == 0, stdout
+    assert "issue_action=created" in stdout
+    calls = harness.read_calls()
+    creates = calls_matching(calls, ["issue", "create"])
+    assert len(creates) == 1, "deletions must create a tracker"
+    assert harness.open_issue_numbers() == ["101"]
+
+
+# ============================================================================
+# VAL-BCI-011: bash syntax check
+# ============================================================================
+def test_bash_syntax_valid():
+    """bash -n parses the script without errors."""
+    result = subprocess.run(
+        ["bash", "-n", str(get_script_path())],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, f"bash -n failed: {result.stderr}"
+
+
+# ============================================================================
+# VAL-BCI-012: script is idempotent — running twice produces no duplicates
+# ============================================================================
+def test_double_run_idempotent(tmp_path: Path):
+    """Running the script twice with the same state doesn't create duplicate issues."""
+    # First run: create tracker with deletion
+    harness = GhMockHarness(tmp_path)
+    rc1, out1, _ = harness.run_script(deleted=["old-branch"])
+    assert rc1 == 0 and "issue_action=created" in out1
+    created = harness.open_issue_numbers()
+    assert created == ["101"]
+
+    # Second run with same deletion - should update (not create new issue)
+    rc2, out2, _ = harness.run_script(deleted=["old-branch"])
+    assert rc2 == 0 and "issue_action=updated" in out2
+
+    # Check that only ONE issue was created total (from the first run)
+    calls = harness.read_calls()
+    create_calls = calls_matching(calls, ["issue", "create"])
+    assert len(create_calls) == 1, f"Expected 1 create call, got {len(create_calls)}"
+    assert harness.open_issue_numbers() == ["101"], "tracker must remain exactly one open issue"
+
+
+# ============================================================================
+# VAL-BCI-013: workflow calls the tracking-issue script (wiring contract)
+# ============================================================================
+def test_workflow_calls_tracking_issue_script():
+    """The shipped composite action invokes branch_cleanup_issue.sh with the
+    documented arguments and always() condition.
+
+    M4 (INFRA-583): the caller workflow is now a thin caller; the INFRA-385
+    tracking-issue wiring lives inside actions/branch-cleanup/action.yml.
+    """
+    action_path = Path(__file__).parent.parent / "actions" / "branch-cleanup" / "action.yml"
+    content = action_path.read_text()
+
+    assert "$GITHUB_ACTION_PATH/branch_cleanup_issue.sh" in content, (
+        "Action must call the INFRA-385 tracking-issue script"
+    )
+    assert "if: always()" in content, "Step must run always so resolved tracking issues get closed"
+    for arg in ("--deleted", "--protected", "--run-url", "--run-date"):
+        assert arg in content, f"Action must pass {arg}"
+    assert "GH_REPO_KEY" in content, "Action must pass the repository key for gh search"
+    # INFRA-589: the tracking-issue step must consume the per-run list files
+    # (RUNNER_TEMP-derived), never fixed /tmp paths that leak state across
+    # runs/repos on shared self-hosted runners.
+    assert "${RUNNER_TEMP:-/tmp}/branch-cleanup-state" in content, (
+        "tracking-issue step must read lists from the per-run RUNNER_TEMP state dir"
+    )
+    assert (
+        "/tmp/deleted_branches.txt" not in content and "/tmp/protected_branches.txt" not in content
+    ), "tracking-issue step must not reference fixed /tmp list files"
+
+
+# ============================================================================
+# VAL-BCI-014: script has execute permission in git index
+# ============================================================================
+def test_script_has_execute_permission():
+    """git ls-files --stage shows mode 100755 for the new script."""
+    result = subprocess.run(
+        ["git", "ls-files", "--stage", "src/infra_core/shell/branch_cleanup_issue.sh"],
+        cwd=Path(__file__).parent.parent,
+        capture_output=True,
+        text=True,
+    )
+    if result.stdout.strip() == "":
+        pytest.skip("script not yet tracked in git index")
+    assert "100755" in result.stdout, "Script must be executable (100755)"
+
+
+# ============================================================================
+# VAL-BCI-015: tracking-issue close comment contains resolution context
+# ============================================================================
+def test_close_comment_contains_context(tmp_path: Path):
+    """The auto-close comment references the run date/url so the close is
+    auditable."""
+    harness = GhMockHarness(
+        tmp_path,
+        issues={781: tracker_body(["fix/pr-ref-consistency-gate (4 unique commits)"])},
+    )
+
+    exit_code, stdout, _ = harness.run_script(
+        run_url="https://github.com/hdot123/memory/actions/runs/999",
+        run_date="2026-08-18 08:00 UTC",
+    )
+
+    assert exit_code == 0, stdout
+    calls = harness.read_calls()
+    closes = calls_matching(calls, ["issue", "close"])
+    assert closes, "tracker must be closed"
+    comment_idx = closes[0].args.index("--comment") + 1
+    comment = closes[0].args[comment_idx]
+    assert "999" in comment and "2026-08-18 08:00 UTC" in comment
+
+
+# ============================================================================
+# VAL-GATE-118: Linear project sync contract tests
+# ============================================================================
+class TestLinearProjectSync:
+    """Contract tests for Linear issue project assignment (VAL-GATE-118, INFRA-586).
+
+    The Linear GitHub integration does not sync the project field, so the
+    script must explicitly assign issues to the correct project after create/update/close.
+    """
+
+    def test_linear_sync_skipped_when_credentials_missing(self, tmp_path: Path):
+        """When LINEAR_API_KEY or LINEAR_PROJECT_ID is missing, sync is skipped silently."""
+        harness = GhMockHarness(tmp_path, env={})
+
+        exit_code, stdout, _ = harness.run_script(deleted=["test-branch"])
+
+        assert exit_code == 0
+        assert "linear_sync=skipped (missing LINEAR_API_KEY or LINEAR_PROJECT_ID)" in stdout
+
+    def test_linear_sync_called_after_create(self, tmp_path: Path):
+        """After creating a new tracker issue, Linear sync is attempted."""
+        harness = GhMockHarness(
+            tmp_path,
+            env={
+                "LINEAR_API_KEY": "test-key",
+                "LINEAR_PROJECT_ID": "test-project-id",
+            },
+        )
+
+        exit_code, stdout, _ = harness.run_script(deleted=["test-branch"])
+
+        assert exit_code == 0
+        assert "issue_action=created" in stdout
+        # The sync function is called (we can't verify curl without mocking it,
+        # but we verify the function is invoked by checking the log message)
+        # In test environment, curl will fail but the function is still called
+
+    def test_linear_sync_called_after_update(self, tmp_path: Path):
+        """After updating an existing tracker issue, Linear sync is attempted."""
+        harness = GhMockHarness(
+            tmp_path,
+            issues={781: tracker_body(["old-branch"])},
+            env={
+                "LINEAR_API_KEY": "test-key",
+                "LINEAR_PROJECT_ID": "test-project-id",
+            },
+        )
+
+        exit_code, stdout, _ = harness.run_script(deleted=["new-branch"])
+
+        assert exit_code == 0
+        assert "issue_action=updated" in stdout
+
+    def test_linear_sync_called_after_close(self, tmp_path: Path):
+        """After closing a tracker issue (all resolved), Linear sync is attempted."""
+        harness = GhMockHarness(
+            tmp_path,
+            issues={781: tracker_body(["old-branch"])},
+            env={
+                "LINEAR_API_KEY": "test-key",
+                "LINEAR_PROJECT_ID": "test-project-id",
+            },
+        )
+
+        # Run with no branches -> should close the tracker
+        exit_code, stdout, _ = harness.run_script()
+
+        assert exit_code == 0
+        assert "issue_action=closed" in stdout
+
+    def test_linear_project_id_injected_via_env(self, tmp_path: Path):
+        """LINEAR_PROJECT_ID is read from environment, not hardcoded."""
+        script_path = get_script_path()
+        content = script_path.read_text()
+
+        # Verify the script references the env var
+        assert "LINEAR_PROJECT_ID" in content
+        # Verify no hardcoded project UUIDs (should be injected)
+        # Linear project IDs are typically UUIDs like "12345678-1234-1234-1234-123456789abc"
+        import re
+
+        uuid_pattern = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+        matches = re.findall(uuid_pattern, content, re.IGNORECASE)
+        assert len(matches) == 0, f"Script contains hardcoded UUIDs: {matches}"
+
+    def test_workflow_action_accepts_linear_inputs(self):
+        """The composite action accepts linear-api-key and linear-project-id inputs."""
+        action_path = Path(__file__).parent.parent / "actions" / "branch-cleanup" / "action.yml"
+        content = action_path.read_text()
+
+        assert "linear-api-key:" in content
+        assert "linear-project-id:" in content
+        assert "LINEAR_API_KEY: ${{ inputs.linear-api-key }}" in content
+        assert "LINEAR_PROJECT_ID: ${{ inputs.linear-project-id }}" in content
+
+    def test_thin_caller_forwards_linear_vars(self):
+        """The thin caller workflow forwards LINEAR_PROJECT_* vars to composite action.
+
+        INFRA-606: infra-core must reference its repo-scoped
+        vars.LINEAR_PROJECT_INFRA_CORE_ID（与 memory-core 的
+        LINEAR_PROJECT_MEMORY_CORE_ID 对称）。此前弱断言（OR 形态）放行了
+        泛型 vars.LINEAR_PROJECT_ID，一旦该仓变量被删/误指其他项目，
+        tracking 的 Linear project 同步会静默失效。
+        """
+        workflow_path = (
+            Path(__file__).parent.parent / ".github" / "workflows" / "branch-cleanup.yml"
+        )
+        content = workflow_path.read_text()
+
+        # Check that the thin caller forwards the Linear project ID
+        assert "linear-project-id:" in content
+        # Must reference the repo-scoped var exactly; generic
+        # vars.LINEAR_PROJECT_ID is the drift this test now rejects.
+        assert "linear-project-id: ${{ vars.LINEAR_PROJECT_INFRA_CORE_ID }}" in content
+        assert "${{ vars.LINEAR_PROJECT_ID }}" not in content, (
+            "thin caller 不得引用泛型 vars.LINEAR_PROJECT_ID（应使用仓级 "
+            "LINEAR_PROJECT_INFRA_CORE_ID，防止跨仓 project 误挂或变量缺失静默跳过）"
+        )
+
+    # ------------------------------------------------------------------
+    # Repo-scoped issue resolution (2026-08-28, INFRA-586 live-validation finding)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _issues_response(pairs: list[tuple[str, str]]) -> str:
+        """Build a GraphQL issues response from (id, description) pairs."""
+        return json.dumps(
+            {"data": {"issues": {"nodes": [{"id": i, "description": d} for i, d in pairs]}}}
+        )
+
+    @staticmethod
+    def _mutation_ok_response() -> str:
+        # VAL-GATE-118 真红根因修复：现行 API 是 issueUpdate，响应形状
+        # {"data": {"issueUpdate": {"success": true, "issue": {"id": ...}}}}。
+        return json.dumps(
+            {"data": {"issueUpdate": {"success": True, "issue": {"id": "lin-issue"}}}}
+        )
+
+    def test_linear_sync_scopes_to_own_repository(self, tmp_path: Path):
+        """VAL-GATE-118: title alone is ambiguous across repos — memory and
+        infra-core both have "Branch cleanup tracking" issues in one Linear
+        workspace. The sync must only tag issues whose description embeds
+        THIS repo's workflow-run URL (github.com/<owner>/<repo>/)."""
+        harness = GhMockHarness(
+            tmp_path,
+            issues={781: tracker_body(["old-branch"])},
+            env={
+                "LINEAR_API_KEY": "test-key",
+                "LINEAR_PROJECT_ID": "proj-memory-core",
+            },
+            curl_responses=[
+                self._issues_response(
+                    [
+                        (
+                            "lin-infra-issue",
+                            "Workflow run: https://github.com/other-org/infra-core/actions/runs/1",
+                        ),
+                        (
+                            "lin-memory-issue",
+                            "Workflow run: https://github.com/example-org/memory/actions/runs/9",
+                        ),
+                    ]
+                ),
+                self._mutation_ok_response(),
+            ],
+        )
+
+        exit_code, stdout, _ = harness.run_script(deleted=["new-branch"])
+
+        assert exit_code == 0, stdout
+        assert "issue_action=updated" in stdout
+        assert "linear_sync=success" in stdout
+        mutations = harness.curl_calls_matching("issueUpdate")
+        assert len(mutations) == 1, "只有本仓的 Linear issue 应被设置 project"
+        assert "lin-memory-issue" in mutations[0]["data"]
+        assert "lin-infra-issue" not in mutations[0]["data"]
+
+    def test_linear_sync_skips_when_no_repo_scoped_match(self, tmp_path: Path):
+        """No description matching GH_REPO_KEY → skip instead of tagging a
+        foreign repo's Linear issue."""
+        harness = GhMockHarness(
+            tmp_path,
+            issues={781: tracker_body(["old-branch"])},
+            env={
+                "LINEAR_API_KEY": "test-key",
+                "LINEAR_PROJECT_ID": "proj-memory-core",
+            },
+            curl_responses=[
+                self._issues_response(
+                    [
+                        (
+                            "lin-foreign-issue",
+                            "Workflow run: https://github.com/other-org/infra-core/actions/runs/1",
+                        )
+                    ]
+                ),
+            ],
+        )
+
+        exit_code, stdout, _ = harness.run_script()
+
+        assert exit_code == 0, stdout
+        assert "linear_sync=skipped (Linear issue not found or not yet synced)" in stdout
+        assert harness.curl_calls_matching("issueUpdate") == []
+
+    def test_linear_sync_tags_all_same_repo_matches(self, tmp_path: Path):
+        """All same-repo tracking issues (current + historical) get the project
+        assignment; issueUpdate+projectId is idempotent so this is safe."""
+        harness = GhMockHarness(
+            tmp_path,
+            issues={781: tracker_body(["old-branch"])},
+            env={
+                "LINEAR_API_KEY": "test-key",
+                "LINEAR_PROJECT_ID": "proj-infra-core",
+            },
+            curl_responses=[
+                self._issues_response(
+                    [
+                        (
+                            "lin-own-current",
+                            "run https://github.com/example-org/memory/actions/runs/9",
+                        ),
+                        (
+                            "lin-own-closed",
+                            "run https://github.com/example-org/memory/actions/runs/3",
+                        ),
+                        (
+                            "lin-foreign",
+                            "run https://github.com/other-org/infra-core/actions/runs/1",
+                        ),
+                    ]
+                ),
+                self._mutation_ok_response(),
+            ],
+        )
+
+        exit_code, stdout, _ = harness.run_script(deleted=["new-branch"])
+
+        assert exit_code == 0, stdout
+        mutations = harness.curl_calls_matching("issueUpdate")
+        tagged = [c for c in mutations if "lin-own" in c["data"]]
+        assert len(tagged) == 2, "本仓新旧两个 tracking issue 都应挂上 project"
+        assert all("lin-foreign" not in c["data"] for c in mutations)
+
+    # ------------------------------------------------------------------
+    # VAL-GATE-118 真红根因修复（2026-08-30, run 33284405687）
+    # Linear 当前 GraphQL schema 已无 issueAddProjectRelation 字段——直连复现
+    # 返回 GRAPHQL_VALIDATION_FAILED "Cannot query field issueAddProjectRelation
+    # on type Mutation"。该路径长期被空 secret 掩盖（同步从未 eligible），
+    # LINEAR_API_KEY 轮换后首次 live 执行即三次 linear_sync=failed。
+    # 现行 API：issueUpdate(id, input: {projectId})。契约钉死新写法，
+    # 死名不得复现。
+    # ------------------------------------------------------------------
+    def test_mutation_uses_current_issue_update_api(self):
+        """同步 mutation 必须是 issueUpdate(id, input: {projectId}) 现行写法。"""
+        content = get_script_path().read_text()
+        assert "mutation { issueUpdate(id: " in content, (
+            "Linear 同步必须使用现行 issueUpdate mutation"
+        )
+        assert "input: { projectId: " in content, "issueUpdate input 必须携带 projectId"
+        assert "{ success issue { id } }" in content, "mutation 返回形状必须 pin"
+        assert ".data.issueUpdate.success" in content, "成功判定必须读取 issueUpdate.success"
+
+    def test_dead_mutation_name_must_not_reappear(self):
+        """回归：issueAddProjectRelation 已从 Linear schema 移除，禁止复现。"""
+        content = get_script_path().read_text()
+        assert "issueAddProjectRelation" not in content, (
+            "issueAddProjectRelation 在 Linear 当前 schema 中不存在"
+            "（GRAPHQL_VALIDATION_FAILED），死名不得复现"
+        )
+
+    # ------------------------------------------------------------------
+    # create-path gap 修复（2026-08-30 live 发现：run 33285476683 / INFRA-632）
+    # 创建路径此前读到的 TRACKER_URL 仍为空 → sync_linear_project 恒走
+    # skipped (no tracker issue)，新建 tracker 的 Linear mirror 永远挂不上
+    # project（后续 run 走 reused-silent 不再触发同步，null 无限期滞留）。
+    # ------------------------------------------------------------------
+    def test_create_path_captures_tracker_and_syncs(self, tmp_path: Path):
+        """create path 必须回填新建 tracker URL 再发起 Linear 同步。"""
+        harness = GhMockHarness(
+            tmp_path,
+            env={
+                "LINEAR_API_KEY": "test-key",
+                "LINEAR_PROJECT_ID": "proj-infra-core",
+            },
+            curl_responses=[
+                self._issues_response(
+                    [
+                        (
+                            "lin-new-tracker",
+                            "run https://github.com/example-org/memory/actions/runs/9",
+                        )
+                    ]
+                ),
+                self._mutation_ok_response(),
+            ],
+        )
+
+        exit_code, stdout, _ = harness.run_script(deleted=["brand-new-branch"])
+
+        assert exit_code == 0, stdout
+        assert "issue_action=created" in stdout
+        # 不得再走 no-tracker skip：TRACKER_URL 必须在 create 后回填
+        assert "linear_sync=skipped (no tracker issue)" not in stdout, (
+            "create path 不得以空 TRACKER_URL 跳过同步（INFRA-632 回归）"
+        )
+        # 以新建 issue 的 URL（mock gh create 返回 .../issues/101）发起同步
+        assert (
+            "Attempting to sync Linear project for issue"
+            " https://github.com/hdot123/memory/issues/101" in stdout
+        )
+        mutations = harness.curl_calls_matching("issueUpdate")
+        assert len(mutations) == 1, "创建当轮就应完成 Linear project 挂载"
+        assert "lin-new-tracker" in mutations[0]["data"]
+        assert "linear_sync=success" in stdout
+
+
+# ============================================================================
+# 仓库上下文双重防线（2026-08-28，mirror memory PR #1060 / INFRA-597）
+# 自建 runner insteadOf 镜像重写使 gh 无法从 workspace remote 解析 host，
+# tracking issue 创建会静默失败。GITHUB_REPOSITORY（Actions 默认注入）→
+# gh issue create 显式 --repo；未设置（本地调试）→ 保持原命令形态。
+# ============================================================================
+def test_issue_create_uses_repo_context_guard():
+    """gh issue create 必须带 GITHUB_REPOSITORY 条件 --repo 守卫。"""
+    content = get_script_path().read_text()
+    assert "${GITHUB_REPOSITORY:-}" in content, (
+        "branch_cleanup_issue.sh must read GITHUB_REPOSITORY (with :- default)"
+    )
+    assert '--repo "${GITHUB_REPOSITORY}"' in content, (
+        "branch_cleanup_issue.sh must append explicit --repo from GITHUB_REPOSITORY"
+    )
+
+
+# ============================================================================
+# 仓库上下文守卫全量覆盖（INFRA-601）：tracking issue 管理脚本中所有
+# 依赖仓库解析的 gh 调用（search/view/close/edit/comment/label）都必须
+# 在 GITHUB_REPOSITORY 注入时追加显式 --repo。行为级断言：mock gh 捕获
+# argv，env 设置 → 每类子命令的调用都带 --repo；env 未设置 → 无 --repo。
+# ============================================================================
+class TestRepoContextGuardAllGhCalls:
+    """INFRA-601: every repo-resolving gh call in branch_cleanup_issue.sh
+    must carry explicit --repo when GITHUB_REPOSITORY is set (runner
+    insteadOf 镜像重写使 remote 推断失效), and keep the original shape
+    when unset (本地调试)."""
+
+    def test_view_close_comment_edit_all_carry_repo_when_env_set(self, tmp_path: Path):
+        """GITHUB_REPOSITORY 注入时：issue view/close/comment/edit 调用全带 --repo。
+
+        两个场景合并覆盖四类子命令：
+        - update 路径（deleted + 变化的 protected 集）→ view/edit/comment
+        - close 路径（无 actionable）→ view/close
+        """
+        # 场景 1：update 路径 → view/edit/comment
+        harness = GhMockHarness(
+            tmp_path,
+            issues={781: tracker_body(["branch-a (1 unique commits)"])},
+            env={"GITHUB_REPOSITORY": "example-org/memory"},
+        )
+        exit_code, stdout, _ = harness.run_script(
+            deleted=["feat/gone"],
+            protected=["branch-a (1 unique commits)", "branch-b (2 unique commits)"],
+        )
+        assert exit_code == 0, stdout
+        assert "issue_action=updated" in stdout
+        calls = harness.read_calls()
+        for prefix in (["issue", "view"], ["issue", "edit"], ["issue", "comment"]):
+            sub = [c for c in calls if c.args[: len(prefix)] == prefix]
+            assert sub, f"expected at least one {' '.join(prefix)} call (update path)"
+
+        # 场景 2：close 路径 → view/close
+        harness2 = GhMockHarness(
+            tmp_path,
+            issues={781: tracker_body(["branch-a (1 unique commits)"])},
+            env={"GITHUB_REPOSITORY": "example-org/memory"},
+        )
+        exit_code, stdout, _ = harness2.run_script()
+        assert exit_code == 0, stdout
+        assert "issue_action=closed" in stdout
+        calls2 = harness2.read_calls()
+
+        # 两场景的全部四类子命令都校验 --repo 注入
+        all_calls = calls + calls2
+        checked = {
+            "issue view": ["issue", "view"],
+            "issue close": ["issue", "close"],
+            "issue comment": ["issue", "comment"],
+            "issue edit": ["issue", "edit"],
+        }
+        seen = set()
+        for label, prefix in checked.items():
+            sub = [c for c in all_calls if c.args[: len(prefix)] == prefix]
+            assert sub, f"expected at least one {label} call across both scenarios"
+            seen.add(label)
+            for call in sub:
+                assert "--repo" in call.args, (
+                    f"{label} argv must carry --repo when GITHUB_REPOSITORY is set: {call.args}"
+                )
+                repo_idx = call.args.index("--repo")
+                assert call.args[repo_idx + 1] == "example-org/memory", (
+                    f"{label} --repo must equal GITHUB_REPOSITORY: {call.args}"
+                )
+        assert seen == set(checked), "all four subcommand classes must have been exercised"
+
+    def test_search_marker_query_carries_repo_when_env_set(self, tmp_path: Path):
+        """GITHUB_REPOSITORY 注入时：marker 搜索（无 --repo 参数形态的
+        gh search issues '"branch-cleanup-tracker"'）也必须带显式 --repo。"""
+        harness = GhMockHarness(
+            tmp_path,
+            env={"GITHUB_REPOSITORY": "example-org/memory"},
+        )
+
+        exit_code, stdout, _ = harness.run_script(deleted=["feat/gone"])
+        assert exit_code == 0, stdout
+
+        searches = [c for c in harness.read_calls() if c.args[:2] == ["search", "issues"]]
+        assert searches, "expected gh search issues calls"
+        marker_query = [c for c in searches if "branch-cleanup-tracker" in " ".join(c.args)]
+        assert marker_query, "expected the marker search call"
+        for call in marker_query:
+            assert "--repo" in call.args, (
+                f"marker search must carry --repo when env set: {call.args}"
+            )
+
+    def test_label_create_carries_repo_when_env_set(self, tmp_path: Path):
+        """GITHUB_REPOSITORY 注入时：gh label create（tracker 创建路径）带 --repo。"""
+        harness = GhMockHarness(
+            tmp_path,
+            env={"GITHUB_REPOSITORY": "example-org/memory"},
+        )
+
+        exit_code, stdout, _ = harness.run_script(deleted=["feat/gone"])
+        assert exit_code == 0, stdout
+        assert "issue_action=created" in stdout
+
+        labels = [c for c in harness.read_calls() if c.args[:2] == ["label", "create"]]
+        assert labels, "expected gh label create calls on the create path"
+        for call in labels:
+            assert "--repo" in call.args, (
+                f"label create must carry --repo when env set: {call.args}"
+            )
+
+    def test_no_repo_flag_when_env_unset(self, tmp_path: Path):
+        """GITHUB_REPOSITORY 未设置（本地调试）→ 所有 gh 调用保持原命令形态（无 --repo，
+        label 搜索调用本身的 --repo "$GH_REPO_KEY" 参数除外，那是查询语义的一部分）。"""
+        harness = GhMockHarness(tmp_path)  # env 不含 GITHUB_REPOSITORY
+
+        exit_code, stdout, _ = harness.run_script(deleted=["feat/gone"])
+        assert exit_code == 0, stdout
+
+        for call in harness.read_calls():
+            if call.args[:2] == ["search", "issues"] and "label:" in " ".join(call.args):
+                continue  # label 搜索原本就带 --repo "$GH_REPO_KEY"（查询参数）
+            assert "--repo" not in call.args, (
+                f"no --repo expected when GITHUB_REPOSITORY unset: {call.args}"
+            )

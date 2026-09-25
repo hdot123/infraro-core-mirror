@@ -1,0 +1,13 @@
+# CODEOWNERS — infraro-core (governance mission M1, VAL-CORE-005)
+#
+# 全仓默认 owner：所有路径变更需 hdot123 审查（配合 ruleset 的
+# code owner review 语义与 governance-check 门禁形成双保险）。
+* @hdot123
+
+# 敏感路径显式条目（即使默认条目未来调整，这些目录也必须锁定）：
+# 治理面：workflow/action/模板/CODEOWNERS 本体
+.github/ @hdot123
+# 引擎 substrate 门禁与冻结记录
+substrate/ @hdot123
+# 引擎核心源码（最深层敏感面）
+src/infra_core/engine/ @hdot123
