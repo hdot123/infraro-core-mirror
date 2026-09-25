@@ -51,12 +51,15 @@ uses: hdot123/infraro-core-mirror/.github/workflows/evolution-scan.yml@v0.18.9
 
 ### 机械变换（与真源的唯一差异）
 
-`scripts/mirror_snapshot.py` 在提交前对快照做两类**确定性**变换（可重复运行、结果一致）：
+`scripts/mirror_snapshot.py` 在提交前对快照做三类**确定性**变换（可重复运行、结果一致）：
 
 1. **公开暴露脱敏**：私有网段 IPv4 地址 → `[REDACTED-IP]`；内部主机名 → `[REDACTED-HOST]`；
    本地主目录路径 → `/Users/[USER]/`、`/home/[USER]/`。GitHub 托管 runner 的家目录
    （`/Users/runner`、`/home/runner`）保留——那是平台路径，不是本地主机路径。
-2. **自引用改指**：镜像自身可执行面（`.github/workflows/**`、`actions/**`）内对真源仓的引用
+2. **可消费面过滤**：`.github/workflows/` 下**只保留声明 `workflow_call` 的可复用 workflow**
+   （即消费者能用 `uses:` 锚定的那些）；真源自身的 CI / 发版 / 运维 workflow 不进入镜像
+   ——只读镜像里它们是死代码，且不属于「被消费面」。
+3. **自引用改指**：镜像自身可执行面（`.github/workflows/**`、`actions/**`）内对真源仓的引用
    改指本镜像，commit-SHA pin 重新 pin 到被镜像的 release tag。否则锚定本镜像的消费者
    仍会去拉私有真源（且真源的 commit SHA 在本仓并不存在）。
 

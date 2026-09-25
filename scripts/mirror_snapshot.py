@@ -6,7 +6,7 @@ knows how an upstream release snapshot differs from the upstream tree, so the
 published mirror is reproducible: run it again on the same snapshot and the
 result is byte-identical (every rule is idempotent).
 
-Two deterministic transforms are applied:
+Three deterministic transforms are applied:
 
 1. Desensitization (public-exposure discipline).
    The mirror is a *new* public repository, so it must not carry the
@@ -20,7 +20,15 @@ Two deterministic transforms are applied:
    GitHub-hosted runner homes (``/Users/runner``, ``/home/runner``) are
    preserved: they are the platform's own paths, not a local host path.
 
-2. Self-reference rewrite (the mirror must be a working drop-in anchor).
+2. Consumable-surface filter (mirror carries the distribution surface, not the
+   engine's own operations).  Only ``.github/workflows/`` files that declare a
+   ``workflow_call`` trigger are kept -- those are exactly the reusable
+   workflows a consumer can anchor with ``uses:``.  The engine's own
+   operational workflows (its CI, release pipeline and maintenance jobs) are
+   dropped: in a read-only mirror they are inert at best and misleading at
+   worst, and they are not part of what consumers consume.
+
+3. Self-reference rewrite (the mirror must be a working drop-in anchor).
    Inside the mirror's own executable surface (``.github/workflows/**`` and
    ``actions/**``) every reference to the engine repository is repointed at the
    mirror itself, and commit-SHA pins are re-pinned to the release tag being
@@ -56,6 +64,7 @@ BINARY_PROBE_BYTES = 8192
 
 # Directories whose contents are the mirror's own executable surface.
 REWRITE_ROOTS = (".github/workflows", "actions")
+WORKFLOW_DIR = (".github", "workflows")
 
 IP_PLACEHOLDER = "[REDACTED-IP]"
 HOST_PLACEHOLDER = "[REDACTED-HOST]"
@@ -71,6 +80,7 @@ PRIVATE_IP_RE = re.compile(
 )
 TOPOLOGY_HOST_RE = re.compile(r"\b(?:ce|node|pve-runner)-\d{1,3}\b")
 LOCAL_HOME_RE = re.compile(r"/(?P<root>Users|home)/(?P<user>[A-Za-z0-9_.-]+)(?=/|$)")
+WORKFLOW_CALL_RE = re.compile(r"(?m)^\s{0,4}workflow_call:\s*$")
 
 ENGINE_SLUG = "hdot123/infraro-core"
 MIRROR_SLUG = "hdot123/infraro-core-mirror"
@@ -116,9 +126,21 @@ def _in_rewrite_surface(rel: Path) -> bool:
     return False
 
 
+def is_workflow_file(rel: Path) -> bool:
+    parts = rel.parts
+    if len(parts) < 3 or rel.suffix not in (".yml", ".yaml"):
+        return False
+    return tuple(parts[-3:-1]) == WORKFLOW_DIR
+
+
 def transform_text(text: str, rel: Path, tag: str):
-    """Return (transformed_text, change_kinds)."""
+    """Return (transformed_text, change_kinds, drop)."""
     kinds = []
+    drop = False
+
+    if is_workflow_file(rel) and not WORKFLOW_CALL_RE.search(text):
+        drop = True
+        kinds.append("dropped-non-reusable-workflow:1")
 
     for kind, pattern in REDACTION_RULES:
         text, hits = pattern.subn(
@@ -141,12 +163,14 @@ def transform_text(text: str, rel: Path, tag: str):
         if hits:
             kinds.append("sha-pin:{hits}".format(hits=hits))
 
-    return text, kinds
+    return text, kinds, drop
 
 
 def find_findings(text: str, rel: Path):
     """Return the residual sensitive findings in a (transformed) text."""
     findings = []
+    if is_workflow_file(rel) and not WORKFLOW_CALL_RE.search(text):
+        findings.append("non-reusable-workflow-file")
     for kind, pattern in REDACTION_RULES:
         findings.extend(
             "{kind}:{value}".format(kind=kind, value=m.group(0))
@@ -190,6 +214,7 @@ def main(argv=None) -> int:
         return 2
 
     changed = 0
+    dropped = 0
     counters = {}
     residual = []
 
@@ -203,11 +228,15 @@ def main(argv=None) -> int:
             )
             continue
 
-        new_text, kinds = transform_text(text, rel, args.tag)
+        new_text, kinds, drop = transform_text(text, rel, args.tag)
         if kinds:
             for kind in kinds:
                 name, _, count = kind.partition(":")
                 counters[name] = counters.get(name, 0) + int(count)
+            if drop:
+                dropped += 1
+                path.unlink()
+                continue
             if new_text != text:
                 changed += 1
                 path.write_bytes(new_text.encode("utf-8", errors="surrogateescape"))
@@ -222,6 +251,7 @@ def main(argv=None) -> int:
         return 0
 
     print("transformed files: {n}".format(n=changed))
+    print("dropped files: {n}".format(n=dropped))
     for name in sorted(counters):
         print("  {name}: {count} replacement(s)".format(name=name, count=counters[name]))
     return 0
