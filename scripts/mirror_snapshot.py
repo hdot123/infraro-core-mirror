@@ -6,7 +6,7 @@ knows how an upstream release snapshot differs from the upstream tree, so the
 published mirror is reproducible: run it again on the same snapshot and the
 result is byte-identical (every rule is idempotent).
 
-Three deterministic transforms are applied:
+Four deterministic transforms are applied:
 
 1. Desensitization (public-exposure discipline).
    The mirror is a *new* public repository, so it must not carry the
@@ -41,6 +41,20 @@ Three deterministic transforms are applied:
    clone/install the private source repository (whose commit SHAs do not exist
    in the mirror) and fail. Documentation, changelog and script surfaces are
    deliberately left untouched so they keep pointing at the true source.
+
+4. Public runner surface (a public repository's jobs must be GitHub-hosted).
+   The source repository is private and runs its jobs on a private
+   self-hosted pool, but this mirror is public and its reusable workflows are
+   anchored by public consumers, where a self-hosted label set would queue
+   forever. Inside the mirror's executable surface every executable runner
+   position is normalized to the public default:
+
+     ``runs-on: [self-hosted, pve-linux]``           -> ``runs-on: ubuntu-latest``
+     ``["self-hosted","pve-linux"]`` (runner input)  -> ``"ubuntu-latest"``
+
+   Only executable positions (``runs-on`` values and the runner input
+   default/fromJSON fallback) are rewritten; prose mentions of the private
+   pool in comments are deliberately left alone.
 
 Usage:
     python3 scripts/mirror_snapshot.py <snapshot-root> --tag <tag>
@@ -87,6 +101,28 @@ MIRROR_SLUG = "hdot123/infraro-core-mirror"
 ENGINE_SLUG_RE = re.compile(re.escape(ENGINE_SLUG) + r"(?!-mirror)")
 MIRROR_SHA_PIN_RE = re.compile(
     re.escape(MIRROR_SLUG) + r"(?P<mid>(?:\.git)?(?:/[^\s@]+)?)@[0-9a-f]{40}\b"
+)
+
+# Public runner surface. The upstream repository is private and executes on a
+# private self-hosted pool; this mirror is public, so its jobs must name a
+# GitHub-hosted runner. Only executable positions are rewritten (a YAML
+# flow-sequence ``runs-on`` value, and the JSON array literal used as the
+# runner input default / fromJSON fallback) -- comment mentions stay as-is.
+PUBLIC_RUNNER = "ubuntu-latest"
+RUNNER_POSITION_RULES = (
+    (
+        "public-runner-labels",
+        re.compile(
+            r"(?m)^(?P<indent>[ \t]*)runs-on:[ \t]*"
+            r"\[self-hosted,[ \t]*pve-linux\](?P<tail>[ \t]*(?:#.*)?)$"
+        ),
+        r"\g<indent>runs-on: " + PUBLIC_RUNNER + r"\g<tail>",
+    ),
+    (
+        "public-runner-json",
+        re.compile(r'\["self-hosted",[ \t]*"pve-linux"\]'),
+        '"' + PUBLIC_RUNNER + '"',
+    ),
 )
 
 # (kind, regex) pairs used both to redact and to verify.
@@ -162,6 +198,10 @@ def transform_text(text: str, rel: Path, tag: str):
         )
         if hits:
             kinds.append("sha-pin:{hits}".format(hits=hits))
+        for kind, pattern, replacement in RUNNER_POSITION_RULES:
+            text, hits = pattern.subn(replacement, text)
+            if hits:
+                kinds.append("{kind}:{hits}".format(kind=kind, hits=hits))
 
     return text, kinds, drop
 
@@ -181,6 +221,12 @@ def find_findings(text: str, rel: Path):
             findings.append("local-home:{value}".format(value=match.group(0)))
     if _in_rewrite_surface(rel) and ENGINE_SLUG_RE.search(text):
         findings.append("engine-self-reference")
+    if _in_rewrite_surface(rel):
+        for kind, pattern, _ in RUNNER_POSITION_RULES:
+            findings.extend(
+                "{kind}:{value}".format(kind=kind, value=m.group(0))
+                for m in pattern.finditer(text)
+            )
     return findings
 
 
