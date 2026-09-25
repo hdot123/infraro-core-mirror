@@ -189,21 +189,30 @@ jobs:
           cp -a "${RUNNER_TEMP}/snapshot/." .
           git add -A
           TREE="$(git write-tree)"
-          if [ -n "${PARENT}" ]; then
-            COMMIT="$(git commit-tree "${TREE}" -p "${PARENT}" -m "release: mirror ${TAG} from upstream snapshot")"
-          else
-            COMMIT="$(git commit-tree "${TREE}" -m "release: mirror ${TAG} from upstream snapshot")"
-          fi
-          git update-ref "refs/tags/${TAG}" "${COMMIT}"
-          git update-ref "refs/heads/release/${TAG}" "${COMMIT}"
 
-          if ! git push --force origin "refs/tags/${TAG}"; then
-            echo "::error::push rejected. If this is the 'workflow ... without workflows permission' rule, the"
-            echo "::error::snapshot introduces .github/workflows/ changes that only a token with the workflows"
-            echo "::error::permission can publish -- configure the MIRROR_PUSH_TOKEN repository secret."
-            exit 1
+          EXISTING_TREE=""
+          if [ -n "${PARENT}" ]; then
+            EXISTING_TREE="$(git rev-parse "${PARENT}^{tree}")"
           fi
-          git push --force origin "refs/heads/release/${TAG}"
+          if [ -n "${EXISTING_TREE}" ] && [ "${EXISTING_TREE}" = "${TREE}" ]; then
+            echo "::notice::${TAG} snapshot is unchanged; skipping the commit/push"
+          else
+            if [ -n "${PARENT}" ]; then
+              COMMIT="$(git commit-tree "${TREE}" -p "${PARENT}" -m "release: mirror ${TAG} from upstream snapshot")"
+            else
+              COMMIT="$(git commit-tree "${TREE}" -m "release: mirror ${TAG} from upstream snapshot")"
+            fi
+            git update-ref "refs/tags/${TAG}" "${COMMIT}"
+            git update-ref "refs/heads/release/${TAG}" "${COMMIT}"
+
+            if ! git push --force origin "refs/tags/${TAG}"; then
+              echo "::error::push rejected. If this is the 'workflow ... without workflows permission' rule, the"
+              echo "::error::snapshot introduces .github/workflows/ changes that only a token with the workflows"
+              echo "::error::permission can publish -- configure the MIRROR_PUSH_TOKEN repository secret."
+              exit 1
+            fi
+            git push --force origin "refs/heads/release/${TAG}"
+          fi
 
       - name: Publish mirror release
         if: steps.fetch.outputs.skip != 'true'
