@@ -1,0 +1,153 @@
+# M6 harden-consolidate-shared-workflows（VAL-HARD-104）：自 shared-workflows 仓
+# auto-merge action @5a0fc1b8946a170a12687d8614d56189e1f8dab5 行为等价移植
+# （该仓已退役：README 重定向 + 归档）。
+#
+# 凭证铁律：本 action 经 env GITHUB_TOKEN 取凭证，由 caller workflow 注入
+# DISPATCH_TOKEN PAT——禁用默认 GITHUB_TOKEN（GitHub 递归防护会抑制其
+# push 事件，release-please 的 push 触发器断链，2026-08-15 两次事故）。
+#
+# INFRA-766 三缺陷修复（2026-09-05 用户批准 + GLM-5.3 交叉验证定案）：
+# ①落盘改法——REST check-runs 用 --paginate 落盘临时文件后本地 jq 处理
+#   （--paginate 与 --jq 组合有预处理坑：多页时每页 JSON 间插入换行，
+#   --jq 分别处理每页导致合并结果丢失数据）；total_count 翻页守卫确保
+#   --paginate 覆盖全部 check runs。
+# ②自排除——过滤 details_url（snake_case）匹配 /runs/${GITHUB_RUN_ID}(/|$)
+#   的条目（边界守卫防止 run id 前缀误匹配：123 ≠ 1234）。
+#   前提声明：自排除正确性依赖 caller 级 concurrency 串行（排队不取消）——
+#   memory caller 已有 concurrency: auto-merge-pipeline；多腿并发时他腿
+#   in_progress job 仍应如实计入。
+# ③可观测——过滤后 INCOMPLETE>0 或 FAILED>0 时，逐条打印涉事实体
+#   name/status/conclusion/app 并打 ::warning:: 再 exit 0。
+#   禁 GraphQL-only 降级、禁 force-merge、禁任何绕过零红的路径。
+#   零红 fail-closed 语义不变。
+name: 'Auto Merge PR'
+description: 'Automatically merge a PR when all CI checks pass'
+
+inputs:
+  pr-number:
+    description: 'PR number to merge'
+    required: true
+    type: string
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Check CI and auto-merge
+      shell: bash
+      env:
+        GH_TOKEN: ${{ env.GITHUB_TOKEN }}
+        PR_NUMBER: ${{ inputs.pr-number }}
+        REPO: ${{ github.repository }}
+      run: |
+        set -euo pipefail
+        echo "=== Auto-merge check for PR #$PR_NUMBER on $REPO ==="
+        
+        # 前提声明：自排除正确性依赖 caller 级 concurrency 串行（排队不取消）。
+        # 多腿并发时他腿 in_progress job 仍应如实计入，仅排除当前 run id。
+        echo "Gate premise: caller concurrency serial (queue, no cancel) — self-exclusion excludes only current run id ($GITHUB_RUN_ID)"
+
+        # Get PR info
+        PR_INFO=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json state,mergeable,headRefOid 2>&1)
+        STATE=$(echo "$PR_INFO" | jq -r '.state // empty' 2>/dev/null)
+
+        if [ -z "$STATE" ]; then
+          echo "Could not get PR info: $PR_INFO"
+          exit 0
+        fi
+
+        if [ "$STATE" != "OPEN" ]; then
+          echo "PR is $STATE, not OPEN. Skipping."
+          exit 0
+        fi
+
+        HEAD_SHA=$(echo "$PR_INFO" | jq -r '.headRefOid')
+
+        # INFRA-766 ①落盘改法：--paginate 落盘临时文件后本地 jq 处理。
+        # 禁止 --paginate 与 --jq 组合（多页预处理坑）。
+        echo "Checking CI status for commit $HEAD_SHA..."
+        CHECK_RUNS_FILE=$(mktemp)
+        trap 'rm -f "$CHECK_RUNS_FILE"' EXIT
+
+        # --paginate 落盘全部 check runs（含 total_count 翻页守卫）
+        gh api "repos/$REPO/commits/$HEAD_SHA/check-runs" --paginate > "$CHECK_RUNS_FILE" 2>/dev/null || true
+
+        # total_count 翻页守卫：验证收集数量与 API 声明总数一致
+        # INFRA-769 修复：必须 jq -s 聚合多页（--paginate 逐页 jq 无 -s 产出 N 个
+        # 换行分隔值，bash [ -lt ] 报错 exit 2 被 if 吞为 false，::warning:: 永不响）
+        COLLECTED_COUNT=$(jq -s '[.[] | .check_runs // . | if type == "array" then .[] else . end] | length' "$CHECK_RUNS_FILE" 2>/dev/null || echo 0)
+        DECLARED_TOTAL=$(jq -s '[.[] | .total_count // empty] | first // empty' "$CHECK_RUNS_FILE" 2>/dev/null || echo "")
+        if [ -n "$DECLARED_TOTAL" ] && [ "$COLLECTED_COUNT" -lt "$DECLARED_TOTAL" ]; then
+          echo "::warning::Pagination guard: collected $COLLECTED_COUNT < declared total_count $DECLARED_TOTAL"
+        fi
+
+        # 本地 jq 处理：提取 check_runs 数组（处理 --paginate 多页格式）
+        ALL_CHECKS=$(jq -s '[.[] | .check_runs // . | if type == "array" then .[] else . end]' "$CHECK_RUNS_FILE" 2>/dev/null)
+
+        if [ -z "$ALL_CHECKS" ] || [ "$ALL_CHECKS" = "null" ] || [ "$ALL_CHECKS" = "[]" ]; then
+          echo "No check runs found, skipping."
+          exit 0
+        fi
+
+        # INFRA-766 ②自排除：过滤 details_url 匹配 /runs/${RUN_ID}(/|$) 的条目。
+        # 边界守卫防止 run id 前缀误匹配（123 ≠ 1234）。
+        # details_url 为 snake_case（GitHub API 实际形态）。
+        FILTERED_CHECKS=$(echo "$ALL_CHECKS" | jq --arg run_id "$GITHUB_RUN_ID" '
+          [.[] | select(
+            (.details_url // "") | test("/runs/\($run_id)(/|$)") | not
+          )]
+        ')
+
+        # INFRA-766 ③可观测：统计后逐条打印涉事实体。
+        # 零红 fail-closed 语义不变：Incomplete 只 retry，Failed 拒绝合并。
+        
+        # Count incomplete checks
+        INCOMPLETE=$(echo "$FILTERED_CHECKS" | jq '[.[] | select(.status != "completed")] | length')
+        echo "Incomplete checks: $INCOMPLETE"
+
+        if [ "$INCOMPLETE" -gt 0 ]; then
+          echo "Incomplete check runs:"
+          echo "$FILTERED_CHECKS" | jq -r '.[] | select(.status != "completed") | "  - \(.name): status=\(.status), conclusion=\(.conclusion // "null"), app=\(.app.slug // "unknown"), details_url=\(.details_url // "null")"'
+          echo "::warning::CI still running ($INCOMPLETE incomplete), will retry on next check_run event."
+          exit 0
+        fi
+
+        # Count failed checks
+        FAILED=$(echo "$FILTERED_CHECKS" | jq '[.[] | select(.conclusion == "failure" or .conclusion == "cancelled" or .conclusion == "timed_out" or .conclusion == "action_required")] | length')
+        echo "Failed checks: $FAILED"
+
+        if [ "$FAILED" -gt 0 ]; then
+          echo "Failed check runs:"
+          echo "$FILTERED_CHECKS" | jq -r '.[] | select(.conclusion == "failure" or .conclusion == "cancelled" or .conclusion == "timed_out" or .conclusion == "action_required") | "  - \(.name): status=\(.status), conclusion=\(.conclusion // "null"), app=\(.app.slug // "unknown"), details_url=\(.details_url // "null")"'
+          echo "::warning::CI has failures ($FAILED failed), not merging."
+          exit 0
+        fi
+
+        # Check mergeable status
+        MERGEABLE=$(echo "$PR_INFO" | jq -r '.mergeable')
+        if [ "$MERGEABLE" = "UNKNOWN" ]; then
+          echo "Mergeable status unknown, waiting 5s..."
+          sleep 5
+          MERGEABLE=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json mergeable --jq '.mergeable')
+        fi
+
+        if [ "$MERGEABLE" != "MERGEABLE" ]; then
+          echo "PR is not mergeable ($MERGEABLE), skipping."
+          exit 0
+        fi
+
+        # All checks pass, merge!
+        echo "=== All CI checks passed. Merging PR #$PR_NUMBER ==="
+        if gh pr merge "$PR_NUMBER" --repo "$REPO" --squash --delete-branch 2>&1; then
+          echo "PR #$PR_NUMBER merged successfully."
+        else
+          # Merge failed — check if it's a race condition (PR already merged)
+          echo "Merge command failed. Checking PR state..."
+          CURRENT_STATE=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json state --jq '.state' 2>/dev/null || echo "UNKNOWN")
+          if [ "$CURRENT_STATE" = "MERGED" ]; then
+            echo "PR already merged (race condition). Treating as success."
+            exit 0
+          else
+            echo "PR state is $CURRENT_STATE. Merge failed for non-race reason."
+            exit 1
+          fi
+        fi
