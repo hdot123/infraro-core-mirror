@@ -1,0 +1,388 @@
+#!/usr/bin/env python3
+"""PR reference consistency check (VAL-GATE-201/202/204).
+
+From memory-core scripts/check_pr_ref_consistency.py: preserves the PR #827
+fail-closed fix (any fetch/parse exception exits 1, not 0), graphql fallback
+chain (avoids gh version dependency on closingIssuesReferences field), and
+three-tier linkback extraction (HTML comment, href, anchor text).
+
+Cross-repo closing references (PR #266 incident, 2026-09-08): a PR body may
+close an issue in another repository (e.g. "Fixes hdot123/mencbo#69" on
+an infra-core PR). Each closing reference's repository is resolved from its
+issue URL so comments are read from the *referenced* repo, never from the
+same-numbered issue in the current repo (which produced a false INFRA-623
+linkback mismatch in CI run 34228063998).
+
+Checks that for a given PR, the set of Linear INFRA IDs extracted from
+linkback comments of all referenced GitHub issues is a subset of the
+INFRA IDs declared in the PR body's "Fixes INFRA-xxx" lines.
+
+Direction: linkback ⊆ Fixes (architecture §3.5)
+- Mismatch (linkback has items not in Fixes) → exit non-zero
+- Compliant (linkback ⊆ Fixes) → exit 0
+- No linkback → exit 0 (backward compat)
+- No closing refs → exit 0 (nothing to check)
+
+Strictly read-only: only `gh pr view` and `gh issue view` commands.
+
+Usage:
+    python3 scripts/check_pr_ref_consistency.py <PR_NUMBER>
+"""
+
+import json
+import os
+import re
+import subprocess
+import sys
+from typing import Any, cast
+
+
+def extract_fixes_infra_ids(pr_body: str) -> set[str]:
+    """Extract INFRA-xxx IDs from GitHub closing keyword lines in PR body.
+
+    Supports all 9 GitHub closing keyword variants (case-insensitive):
+    - close, closes, closed
+    - fix, fixes, fixed
+    - resolve, resolves, resolved
+
+    Also supports comma-separated lists (e.g., "Fixes INFRA-100, INFRA-200").
+
+    Args:
+        pr_body: The PR body text
+
+    Returns:
+        Set of INFRA IDs (e.g., {"INFRA-335", "INFRA-337"})
+    """
+    if not pr_body:
+        return set()
+
+    # Match all 9 GitHub closing keyword variants (case-insensitive) with
+    # \b word boundary to avoid partial matches (e.g., "def" shouldn't match "fix")
+    # Supports comma-separated lists: "Fixes INFRA-100, INFRA-200"
+    # Also supports Oxford comma variant with 'and' connector:
+    #   - "Fixes INFRA-1, INFRA-2, and INFRA-3" (Oxford comma)
+    #   - "Fixes INFRA-1, INFRA-2 and INFRA-3" (no comma before 'and')
+    keyword_pattern = (
+        r"\b(?:close|closes|closed|fix|fixes|fixed|resolve|resolves|resolved)\s+"
+        r"((?:INFRA-\d+)(?:\s*(?:,\s*(?:and\s+)?|and\s+)INFRA-\d+)*)"
+    )
+    matches = re.findall(keyword_pattern, pr_body, re.IGNORECASE)
+
+    # Extract all INFRA-xxx IDs from each match (handles comma-separated lists)
+    ids = set()
+    for match in matches:
+        id_pattern = r"INFRA-\d+"
+        for infra_id in re.findall(id_pattern, match):
+            ids.add(infra_id)
+
+    return ids
+
+
+def extract_linkback_from_comments(comments_text: str) -> str | None:
+    """Extract INFRA-xxx ID from linear-linkback comment.
+
+    Reuses the extraction logic from evolution_utils.extract_linkback_anchor().
+    Searches for the linear-linkback marker and extracts the INFRA ID from
+    the href or anchor text.
+
+    Args:
+        comments_text: Combined comment bodies from gh issue view
+
+    Returns:
+        INFRA-xxx ID if found, None otherwise
+    """
+    if not comments_text or "linear-linkback" not in comments_text:
+        return None
+
+    # Split into blocks (blank-line separated)
+    blocks = []
+    current: list[str] = []
+    for line in comments_text.split("\n"):
+        if line.strip() == "":
+            if current:
+                blocks.append("\n".join(current))
+                current = []
+        else:
+            current.append(line)
+    if current:
+        blocks.append("\n".join(current))
+
+    # Find first block containing "linear-linkback" marker
+    linkback_block = None
+    for block in blocks:
+        if "linear-linkback" in block:
+            linkback_block = block
+            break
+
+    if not linkback_block:
+        return None
+
+    # Tier 1: inline HTML comment format <!-- linear-linkback INFRA-xxx -->
+    pattern = r"<!--\s*linear-linkback\s+(INFRA-\d+)\s*-->"
+    match = re.search(pattern, linkback_block)
+    if match:
+        return match.group(1)
+
+    # Tier 2a: href format (linear.app/OWNER/issue/INFRA-xxx)
+    href_pattern = r'linear\.app/[^/\s"]+/issue/([A-Z]+-\d+)'
+    match = re.search(href_pattern, linkback_block)
+    if match:
+        return match.group(1)
+
+    # Tier 2b: anchor text (<a ...>INFRA-xxx</a>)
+    anchor_pattern = r"<a[^>]*>\s*([A-Z]+-\d+)\s*</a>"
+    match = re.search(anchor_pattern, linkback_block)
+    if match:
+        return match.group(1)
+
+    return None
+
+
+def _resolve_repo_owner_name() -> tuple[str, str]:
+    """Resolve (owner, name) for gh issue view repository context.
+
+    Priority (2026-08-28, PR #1060 教训):
+    1. GITHUB_REPOSITORY env（Actions 运行器默认注入 OWNER/REPO）— 自建
+       runner 配置 git url.<mirror>.insteadOf 全局重写后，git remote
+       get-url 返回镜像 URL，解析出错误的 owner/repo。显式 env 优先，
+       完全绕开 remote 推断。
+    2. origin remote URL fallback（本地运行场景）。
+
+    Returns:
+        Tuple of (owner, repo_name)
+
+    Raises:
+        RuntimeError: if origin URL is missing or unparseable
+    """
+    github_repository = os.environ.get("GITHUB_REPOSITORY", "").strip()
+    if github_repository.count("/") == 1:
+        owner, _, name = github_repository.partition("/")
+        if owner and name:
+            return owner, name
+    result = subprocess.run(
+        ["git", "remote", "get-url", "origin"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    url = result.stdout.strip()
+    # SSH form: git@github.com:OWNER/REPO.git
+    # HTTPS form: https://github.com/OWNER/REPO.git
+    m = re.search(r"[:/]([^/:]+/[^/]+?)(?:\.git)?/?$", url)
+    if not m:
+        raise RuntimeError(f"Cannot parse owner/repo from origin URL: {url}")
+    owner, _, name = m.group(1).partition("/")
+    return owner, name
+
+
+def fetch_pr_data(pr_number: int) -> dict[str, Any]:
+    """Fetch PR body and closing issue references via gh CLI.
+
+    Uses `gh api graphql` instead of `gh pr view --json closingIssuesReferences`:
+    the latter's field registry only recognizes closingIssuesReferences on
+    gh >= 2.67.0; older gh on self-hosted runners rejects it with
+    "Unknown JSON field" (PR #797). `gh api graphql` resolves fields
+    server-side and is gh-version independent.
+
+    Args:
+        pr_number: GitHub PR number
+
+    Returns:
+        Dict with 'body' (str) and 'closingIssuesReferences' (list of dicts)
+    """
+    owner, repo = _resolve_repo_owner_name()
+    query = (
+        "query($owner:String!,$repo:String!,$num:Int!){"
+        "repository(owner:$owner,name:$repo){"
+        "pullRequest(number:$num){"
+        "body "
+        "closingIssuesReferences(first:50){nodes{number title url}}"
+        "}}}"
+    )
+    result = subprocess.run(
+        [
+            "gh",
+            "api",
+            "graphql",
+            "-f",
+            f"query={query}",
+            "-f",
+            f"owner={owner}",
+            "-f",
+            f"repo={repo}",
+            "-F",
+            f"num={pr_number}",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    payload = cast(dict[str, Any], json.loads(result.stdout))
+    pr = payload.get("data", {}).get("repository", {}).get("pullRequest")
+    if pr is None:
+        errors = payload.get("errors")
+        raise RuntimeError(f"GraphQL query returned no pullRequest: {errors}")
+    # Flatten {nodes: [...]} to a flat list, matching the historical
+    # `gh pr view --json` shape consumed by main() and test fixtures.
+    refs = cast(dict[str, Any], pr.get("closingIssuesReferences")) or {}
+    pr["closingIssuesReferences"] = refs.get("nodes", [])
+    return cast(dict[str, Any], pr)
+
+
+def _resolve_repo_from_issue_url(url: str) -> tuple[str, str] | None:
+    """Resolve (owner, name) from a closing reference's issue URL.
+
+    closingIssuesReferences nodes may point at issues in other repositories
+    (cross-repo closing keyword syntax, e.g. "Fixes hdot123/mencbo#69").
+    Parsing owner/repo from the node URL lets the guard read comments from
+    the referenced repository instead of the same-numbered issue in the
+    current repository (PR #266 false-positive root cause).
+
+    Args:
+        url: The issue URL from the GraphQL closingIssuesReferences node
+
+    Returns:
+        Tuple of (owner, repo_name), or None if the URL is missing or not a
+        github.com issue URL (caller falls back to the current repository)
+    """
+    m = re.search(r"^https://github\.com/([^/\s]+/[^/\s]+)/issues/\d+", (url or "").strip())
+    if not m:
+        return None
+    owner, _, name = m.group(1).partition("/")
+    return (owner, name) if owner and name else None
+
+
+def fetch_issue_comments(issue_number: int, repo: str | None = None) -> str:
+    """Fetch issue comments via gh CLI.
+
+    ``repo`` 显式指定（2026-09-08，PR #266）：closing reference 可跨仓
+    （infra-core PR 写 "Fixes hdot123/mencbo#69"）。此前固定按当前仓
+    解析同一编号的 issue，读到错误仓库的同号 issue（infra-core#69 release
+    PR 的 linkback INFRA-623），对 INFRA-893 PR 产生假阳性。调用方从 ref
+    url 解析出 owner/repo 后必须显式传入，显式值优先于一切环境推断。
+
+    ``repo`` 未指定时保持原行为（向后兼容，本地调试）：GITHUB_REPOSITORY
+    env（Actions 默认注入）可解析时追加 ``--repo``（CI 场景，绕开 remote
+    推断，2026-08-28 PR #1060 镜像重写教训）；未设置时保持原命令形态
+    （本地调试，依赖 origin remote）。
+
+    Args:
+        issue_number: GitHub issue number
+        repo: Explicit "owner/name" repository context for the issue
+
+    Returns:
+        Combined comment bodies as string
+    """
+    cmd: list[str] = ["gh", "issue", "view", str(issue_number)]
+    if repo is not None:
+        cmd += ["--repo", repo]
+    elif os.environ.get("GITHUB_REPOSITORY", "").strip():
+        owner, current_repo = _resolve_repo_owner_name()
+        cmd += ["--repo", f"{owner}/{current_repo}"]
+    cmd += ["--json", "comments", "--jq", ".comments[].body"]
+    result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    return result.stdout
+
+
+def main(args: list[str] | None = None) -> int:
+    """Main entry point.
+
+    Args:
+        args: Command-line arguments (defaults to sys.argv[1:])
+
+    Returns:
+        Exit code (0 = pass, non-zero = fail)
+    """
+    if args is None:
+        args = sys.argv[1:]
+
+    if len(args) != 1:
+        print("Usage: python3 scripts/check_pr_ref_consistency.py <PR_NUMBER>", file=sys.stderr)
+        return 2
+
+    try:
+        pr_number = int(args[0])
+    except ValueError:
+        print(f"Error: PR number must be an integer, got '{args[0]}'", file=sys.stderr)
+        return 2
+
+    # Fetch PR data — fail-closed: any exception (subprocess error, JSON
+    # decode failure, runtime error from null payload) must exit 1 to prevent
+    # CI gate from silently passing on transient API failures.
+    # Empirical evidence: 2026-08-19 04:25Z PR #827 "Post api.github.com/graphql EOF"
+    # previously exited 0; this fix hardens all fetch/parse paths to exit 1.
+    try:
+        pr_data = fetch_pr_data(pr_number)
+    except Exception as e:
+        print(f"Error: Failed to fetch PR #{pr_number}: {e}", file=sys.stderr)
+        return 1
+
+    pr_body = pr_data.get("body") or ""  # None body defense: convert None → ""
+    closing_refs = pr_data.get("closingIssuesReferences", [])
+
+    # No closing references → nothing to check
+    if not closing_refs:
+        print(f"PR #{pr_number}: No closing issue references, skipping check")
+        return 0
+
+    # Extract Fixes IDs from PR body
+    fixes_ids = extract_fixes_infra_ids(pr_body)
+
+    # Collect linkback IDs from all referenced issues
+    linkback_ids = set()
+    issue_numbers = [ref["number"] for ref in closing_refs]
+
+    print(f"PR #{pr_number}: Checking {len(issue_numbers)} referenced issue(s): {issue_numbers}")
+    print(f"PR #{pr_number}: Fixes set = {sorted(fixes_ids) if fixes_ids else '{}'}")
+
+    # Default repository context (used when a ref URL is missing/unparseable);
+    # fail-closed like every other fetch path.
+    try:
+        default_owner, default_name = _resolve_repo_owner_name()
+    except Exception as e:
+        print(f"Error: Failed to resolve repository context: {e}", file=sys.stderr)
+        return 1
+
+    for ref in closing_refs:
+        issue_num = ref["number"]
+        # Cross-repo closing refs (PR #266): resolve the issue's actual
+        # repository from its URL; never assume the current repo.
+        resolved = _resolve_repo_from_issue_url(ref.get("url", "") or "")
+        repo_ctx = f"{resolved[0]}/{resolved[1]}" if resolved else f"{default_owner}/{default_name}"
+        try:
+            comments = fetch_issue_comments(issue_num, repo=repo_ctx)
+            linkback = extract_linkback_from_comments(comments)
+            if linkback:
+                linkback_ids.add(linkback)
+                print(f"  Issue #{issue_num} ({repo_ctx}): linkback = {linkback}")
+            else:
+                print(f"  Issue #{issue_num} ({repo_ctx}): no linkback (backward compat)")
+        except Exception as e:
+            print(
+                f"Error: Failed to fetch comments for issue #{issue_num} ({repo_ctx}): {e}",
+                file=sys.stderr,
+            )
+            return 1
+
+    # Check subset condition: linkback ⊆ Fixes
+    print(f"PR #{pr_number}: Linkback set = {sorted(linkback_ids) if linkback_ids else '{}'}")
+
+    missing_ids = linkback_ids - fixes_ids
+
+    if missing_ids:
+        print("\n❌ FAIL: Linkback set is NOT a subset of Fixes set")
+        print(f"   Missing from Fixes: {sorted(missing_ids)}")
+        print(f"   Linkback: {sorted(linkback_ids)}")
+        print(f"   Fixes: {sorted(fixes_ids)}")
+        return 1
+
+    if linkback_ids:
+        print("\n✅ PASS: Linkback set ⊆ Fixes set")
+    else:
+        print("\n✅ PASS: No linkbacks found (backward compat)")
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
