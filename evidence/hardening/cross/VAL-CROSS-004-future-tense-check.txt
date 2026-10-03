@@ -1,0 +1,2 @@
+48:终审简报 P0 建议「决策文档沉淀（memory/kb/decisions/，走 PR + read-first-CRUD）」——**结构上不可能**：`memory/` 整目录被忽略，现有 3 份决策文档全部是本地未跟踪文件。
+69:归入态一的依据：四项全部在 CI 内以红/绿判定，无网络凭证依赖面（Gate1 走公开源码 tarball 兜底）。**验证边界**（如实标注，非未落地项）：Gate1 的 CI 传输路径只在模拟环境（无 sibling / 无 gh 凭证 / 空 token）实测过，权威判定以 PR #141 的 `substrate-gate-suite` 结果为准；若该 check 红且确认为模板源不可达，既定回退为 revert `9d7b6ae`（其余三面不受影响）。
