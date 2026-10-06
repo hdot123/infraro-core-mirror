@@ -1,0 +1,205 @@
+# Layer 1+2: 宿主工具 + 缓存锁定（2026-08-28 runner-hardening，抢救性重构自 PR #37）
+#
+# 动机（2026-08-27 裁定 Pin & Freeze）：
+# 1. Layer 1: 三台 pve runner（memory-runnerz 共享组）全局路径锁定固定版本工具二进制
+#    （uv/ruff/mypy/actionlint/shellcheck/jq），CI 按 PATH 优先原则调用宿主预装二进制，
+#    版本清单见仓库根 runner-tools.toml（单一事实源）
+# 2. Layer 2: UV_CACHE_DIR=/var/cache/uv、PIP_CACHE_DIR=/var/cache/pip（runner 服务用户属主），
+#    per-run venv 的依赖安装从共享缓存取包，秒级建仓
+# 3. 护栏铁律：只锁工具二进制，被测包的 per-run venv 独立安装不动（2026-08-25 环境遮蔽教训）
+# 4. 「Install dependencies」步骤（pip install -e ".[dev]"）不可缺失——被取代的 PR #37
+#    首版重构时误删此步骤导致 CI 全红（INFRA-590），本文件以契约测试钉住其存在
+#
+# 本 action 在 $RUNNER_TEMP 下按 run_id + run_attempt 创建一次性 venv 并前置到 PATH
+# （含 VIRTUAL_ENV/VENV_PATH），job 结束由 runner 自动清理——每次运行从零解析依赖，
+# rerun 不共享旧状态。工具二进制走 PATH 优先级：宿主预装 > RUNNER_TEMP fallback 下载。
+#
+# 前置要求：调用 job 已 checkout（fast-fail 步骤读取仓库关键文件验证完整性）；
+# 系统 python3 为 3.12（pyproject requires-python ==3.12.*，pve runner 预装）。
+# 回退分支：镜像缺 python3-venv（ensurepip）时 --without-pip + get-pip 引导。
+name: "Setup venv"
+description: "Create and activate a Python virtual environment for CI jobs"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Fast-fail on incomplete checkout
+      shell: bash
+      run: |
+        set -e
+        # 预装环境锁定第 3 层：checkout 残缺（半死 checkout）时立即失败，
+        # 不让下游报迷惑性错误（2026-08-27 runner-02/03 工作区中毒事件）。
+        missing=0
+        for f in .git pyproject.toml .github/actions/setup-venv/action.yml; do
+          if [ ! -e "$f" ]; then
+            echo "::error::仓库关键文件缺失：$f —— checkout 残缺（半死 checkout），请 rerun 本 job 或清理 runner 工作区后重试"
+            missing=1
+          fi
+        done
+        if [ "$missing" -ne 0 ]; then
+          exit 1
+        fi
+        echo "✓ checkout 完整性检查通过（.git / pyproject.toml / setup-venv action.yml）"
+
+    - name: Detect runner type and install toolchain
+      shell: bash
+      run: |
+        set -eu
+
+        # Detect if we're on self-hosted or GitHub-hosted runner
+        IS_SELF_HOSTED=false
+        if [ "${{ runner.name }}" != "" ] && [[ "${{ runner.name }}" =~ ^GitHub ]]; then
+          IS_SELF_HOSTED=false
+        else
+          IS_SELF_HOSTED=true
+        fi
+
+        echo "IS_SELF_HOSTED=$IS_SELF_HOSTED" >> "$GITHUB_ENV"
+
+        if [ "$IS_SELF_HOSTED" = "false" ]; then
+          echo "Running on GitHub-hosted runner, installing toolchain from runner-tools.toml..."
+          
+          # Parse runner-tools.toml to extract versions
+          # Since GitHub-hosted runners don't have TOML parsing, we'll install fixed versions
+          # Based on the runner-tools.toml specification
+          
+          # Install uv (0.12.7)
+          if ! command -v uv >/dev/null; then
+            echo "Installing uv..."
+            curl -LsSf --retry 3 --max-time 60 https://astral.sh/uv/0.12.7/install.sh | sh
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          fi
+          
+          # Install ruff (0.16.3)
+          if ! command -v ruff >/dev/null; then
+            echo "Installing ruff..."
+            pipx install 'ruff==0.16.3' --quiet || pip install 'ruff==0.16.3' --quiet
+          fi
+          
+          # Install mypy (2.3.1)
+          if ! command -v mypy >/dev/null; then
+            echo "Installing mypy..."
+            pipx install 'mypy==2.3.1' --quiet || pip install 'mypy==2.3.1' --quiet
+          fi
+          
+          # Install actionlint (1.7.11)
+          if ! command -v actionlint >/dev/null; then
+            echo "Installing actionlint..."
+            curl -fsSL --retry 3 --max-time 60 https://raw.githubusercontent.com/rhysd/actionlint/v1.7.12/scripts/download-actionlint.bash | bash /dev/stdin "1.7.11"
+            echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+          fi
+          
+          # Install shellcheck (0.10.0)
+          if ! command -v shellcheck >/dev/null; then
+            echo "Installing shellcheck..."
+            if [[ "$OSTYPE" == "linux-gnu"* ]]; then
+              mkdir -p "$RUNNER_TEMP/shellcheck"
+              curl -fsSL --retry 3 --max-time 60 "https://github.com/koalaman/shellcheck/releases/download/v0.10.0/shellcheck-v0.10.0.linux.x86_64.tar.xz" | tar -xJ -C "$RUNNER_TEMP/shellcheck"
+              cp "$RUNNER_TEMP/shellcheck/shellcheck-v0.10.0/shellcheck" "$RUNNER_TEMP/"
+              chmod +x "$RUNNER_TEMP/shellcheck"
+            fi
+            echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+          fi
+          
+          # Install jq (1.7)
+          if ! command -v jq >/dev/null; then
+            echo "Installing jq..."
+            if [[ "$OSTYPE" == "linux-gnu"* ]]; then
+              curl -fsSL --retry 3 --max-time 60 "https://github.com/jqlang/jq/releases/download/jq-1.7/jq-linux-amd64" -o "$RUNNER_TEMP/jq"
+              chmod +x "$RUNNER_TEMP/jq"
+            fi
+            echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+          fi
+          
+          echo "GitHub-hosted toolchain installation complete"
+        fi
+
+        # Layer 2: Shared cache directory for hosted runners (self-hosted use global cache)
+        if [ "$IS_SELF_HOSTED" = "false" ]; then
+          export UV_CACHE_DIR="$RUNNER_TEMP/uv-cache"
+          export PIP_CACHE_DIR="$RUNNER_TEMP/pip-cache"
+        else
+          export UV_CACHE_DIR="/var/cache/uv"
+          export PIP_CACHE_DIR="/var/cache/pip"
+        fi
+
+        # Layer 1: Host toolchain detection (for self-hosted runners)
+        echo "::group::Host toolchain detection"
+        for tool in uv ruff mypy actionlint shellcheck jq; do
+          if command -v "$tool" >/dev/null; then
+            ver="$($tool --version 2>/dev/null | head -1 || echo 'unknown')"
+            echo "  $tool: $(which $tool) ($ver)"
+          else
+            echo "::warning::$tool not found on host PATH (will use GitHub-hosted installation)"
+          fi
+        done
+        echo "::endgroup::"
+
+    - name: Create per-run venv (host tools priority + shared cache)
+      shell: bash
+      env:
+        RUN_ID: ${{ github.run_id }}
+        RUN_ATTEMPT: ${{ github.run_attempt }}
+      run: |
+        set -eu
+
+        # Layer 2: Already set in previous step based on runner type
+        export UV_CACHE_DIR="${{ env.UV_CACHE_DIR }}"
+        export PIP_CACHE_DIR="${{ env.PIP_CACHE_DIR }}"
+
+        # Per-run venv 隔离（被测包依赖，不锁宿主工具）
+        VENV="$RUNNER_TEMP/venv-${RUN_ID}-${RUN_ATTEMPT}"
+        rm -rf "$VENV"
+        if ! python3 -m venv "$VENV" 2>"$RUNNER_TEMP/venv-err.log"; then
+          echo "::warning::python3 -m venv failed (ensurepip missing?), falling back to --without-pip + get-pip"
+          cat "$RUNNER_TEMP/venv-err.log" || true
+          rm -rf "$VENV"
+          python3 -m venv --without-pip "$VENV"
+          if command -v curl >/dev/null; then
+            curl --retry 3 --retry-delay 5 --retry-all-errors --max-time 60 -fsSL \
+              -o "$RUNNER_TEMP/get-pip.py" https://bootstrap.pypa.io/get-pip.py
+          else
+            wget -q -O "$RUNNER_TEMP/get-pip.py" https://bootstrap.pypa.io/get-pip.py
+          fi
+          "$VENV/bin/python" "$RUNNER_TEMP/get-pip.py" --disable-pip-version-check
+        fi
+
+        # venv 前置到 PATH（宿主工具仍可经绝对路径调用）；VENV_PATH 供下游步骤激活
+        echo "$VENV/bin" >> "$GITHUB_PATH"
+        echo "VIRTUAL_ENV=$VENV" >> "$GITHUB_ENV"
+        echo "VENV_PATH=$VENV" >> "$GITHUB_ENV"
+        
+        # Only set UV_CACHE_DIR if it's not empty (prevent empty string pollution)
+        if [ -n "$UV_CACHE_DIR" ]; then
+          echo "UV_CACHE_DIR=$UV_CACHE_DIR" >> "$GITHUB_ENV"
+        fi
+        
+        # Only set PIP_CACHE_DIR if it's not empty (prevent empty string pollution)
+        if [ -n "$PIP_CACHE_DIR" ]; then
+          echo "PIP_CACHE_DIR=$PIP_CACHE_DIR" >> "$GITHUB_ENV"
+        fi
+
+        # venv pip 升级（main 原有语义，本 PR 重构时曾遗漏致 rebase 后 advisory 红）：
+        # ensurepip 自带 pip 24.0 已积累 7 条 PYSEC 公告（pip-audit 扫描 venv 自身，
+        # 2026-08-29 run 33263696898 实证），不升级则 advisory-bundle 必红、零红合并不可达
+        "$VENV/bin/python" -m pip install --upgrade pip --quiet
+
+        "$VENV/bin/python" --version
+        "$VENV/bin/python" -m pip --version
+
+    - name: Install dependencies
+      shell: bash
+      run: |
+        set -e
+
+        # Activate venv
+        source "${{ env.VENV_PATH }}/bin/activate"
+
+        # Install package with dev dependencies
+        # 铁律（INFRA-590）：本步骤不可移除——pip install -e ".[dev]" 是全部下游
+        # job（pytest/ruff/mypy/guards）的依赖来源
+        echo "Installing infra-core with dev dependencies..."
+        pip install -e ".[dev]" --quiet
+
+        echo "✓ Dependencies installed"
+        pip list | grep -E "(infra-core|pytest|ruff|mypy)" || true
