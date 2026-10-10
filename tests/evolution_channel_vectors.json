@@ -1,0 +1,204 @@
+{
+  "_meta": {
+    "name": "evolution-channel-vectors",
+    "purpose": "演化卡通道识别共享测试向量（Mac 侧 trigger-droid.sh 与 CF Worker 侧路径 D 共用；双仓以 sha256 校验同步）",
+    "semantics": "expected_evolution=true 表示该（title, labels）组合必须被识别为演化卡并拒绝自动执行；expected_reason 取值 title_prefix | normalized_labels | null（null 仅用于 expected_evolution=false）",
+    "labels_form": "labels 为归一化前的标签名数组（canonical 形态）；payload 层形态变体（nodes/null/数组）由各侧解析层先折叠为本形态",
+    "updated_at": "2026-10-04",
+    "owner_ruling": "2026-10-04 Mac 退出自进化（通道分离，演化卡唯一通道=闸门化 R1）"
+  },
+  "vectors": [
+    {
+      "name": "title_prefix_standard",
+      "title": "[evolution] CODE_HYGIENE_001",
+      "labels": [],
+      "expected_evolution": true,
+      "expected_reason": "title_prefix",
+      "note": "scanner create_issue 恒定标题形态"
+    },
+    {
+      "name": "title_prefix_uppercase",
+      "title": "[EVOLUTION] CODE_HYGIENE_001",
+      "labels": [],
+      "expected_evolution": true,
+      "expected_reason": "title_prefix",
+      "note": "前缀大小写不敏感"
+    },
+    {
+      "name": "title_prefix_mixedcase",
+      "title": "[Evolution] refactor duplicated helper",
+      "labels": [],
+      "expected_evolution": true,
+      "expected_reason": "title_prefix",
+      "note": "前缀大小写不敏感（混合）"
+    },
+    {
+      "name": "title_prefix_leading_space",
+      "title": " [evolution] CODE_HYGIENE_001",
+      "labels": [],
+      "expected_evolution": true,
+      "expected_reason": "title_prefix",
+      "note": "前导空白折叠后仍按前缀识别"
+    },
+    {
+      "name": "title_prefix_leading_tab",
+      "title": "\t[evolution] CODE_HYGIENE_001",
+      "labels": [],
+      "expected_evolution": true,
+      "expected_reason": "title_prefix",
+      "note": "前导制表符折叠"
+    },
+    {
+      "name": "title_prefix_no_space_after_bracket",
+      "title": "[evolution]X",
+      "labels": [],
+      "expected_evolution": true,
+      "expected_reason": "title_prefix",
+      "note": "前缀后无空格仍按前缀识别（startswith 语义）"
+    },
+    {
+      "name": "title_prefix_embedded_not_evolution",
+      "title": "Feature: [evolution] demo",
+      "labels": [],
+      "expected_evolution": false,
+      "expected_reason": null,
+      "note": "前缀必须位于标题开头（解先建后贴竞态的创建时稳定信号仅指前缀位置）"
+    },
+    {
+      "name": "labels_exact",
+      "title": "",
+      "labels": ["evolution-found"],
+      "expected_evolution": true,
+      "expected_reason": "normalized_labels",
+      "note": "标准标签名"
+    },
+    {
+      "name": "labels_with_clean_title",
+      "title": "Refactor duplicated helper",
+      "labels": ["evolution-found"],
+      "expected_evolution": true,
+      "expected_reason": "normalized_labels",
+      "note": "无前缀标题但带演化标签：标签信号生效"
+    },
+    {
+      "name": "labels_case_mixed",
+      "labels": ["Evolution-Found"],
+      "expected_evolution": true,
+      "expected_reason": "normalized_labels",
+      "note": "标签大小写折叠",
+      "title": ""
+    },
+    {
+      "name": "labels_uppercase",
+      "labels": ["EVOLUTION-FOUND"],
+      "expected_evolution": true,
+      "expected_reason": "normalized_labels",
+      "note": "标签全大写折叠",
+      "title": ""
+    },
+    {
+      "name": "labels_surrounding_whitespace",
+      "labels": [" evolution-found "],
+      "expected_evolution": true,
+      "expected_reason": "normalized_labels",
+      "note": "标签首尾空格修剪",
+      "title": ""
+    },
+    {
+      "name": "labels_inner_newline",
+      "labels": ["evolution-found\n"],
+      "expected_evolution": true,
+      "expected_reason": "normalized_labels",
+      "note": "标签内换行符修剪",
+      "title": ""
+    },
+    {
+      "name": "labels_multiple_with_marker",
+      "labels": ["automation", "evolution-found"],
+      "expected_evolution": true,
+      "expected_reason": "normalized_labels",
+      "note": "多标签中含演化标签",
+      "title": ""
+    },
+    {
+      "name": "labels_multiple_case_variant",
+      "labels": ["automation", "Evolution-Found"],
+      "expected_evolution": true,
+      "expected_reason": "normalized_labels",
+      "note": "多标签+大小写变体",
+      "title": ""
+    },
+    {
+      "name": "labels_missing",
+      "labels": null,
+      "expected_evolution": false,
+      "expected_reason": null,
+      "note": "标签缺失（先建后贴竞态窗口）：无前缀标题时不识别",
+      "title": "Refactor duplicated helper"
+    },
+    {
+      "name": "labels_empty_array",
+      "labels": [],
+      "expected_evolution": false,
+      "expected_reason": null,
+      "note": "标签为空数组",
+      "title": "Fix gateway timeout"
+    },
+    {
+      "name": "labels_typo_underscore",
+      "labels": ["evolution_found"],
+      "expected_evolution": false,
+      "expected_reason": null,
+      "note": "下划线变体不是演化标签",
+      "title": ""
+    },
+    {
+      "name": "labels_sibling_family",
+      "labels": ["evolution-heartbeat"],
+      "expected_evolution": false,
+      "expected_reason": null,
+      "note": "同族标签（heartbeat 自愈）不是演化标签",
+      "title": ""
+    },
+    {
+      "name": "labels_cleared_marker_alone",
+      "labels": ["r1-cleared"],
+      "expected_evolution": false,
+      "expected_reason": null,
+      "note": "闸门标签单独出现不构成演化识别（白名单是 Worker 侧闸①的职责）",
+      "title": ""
+    },
+    {
+      "name": "both_signals_title_and_labels",
+      "labels": ["evolution-found"],
+      "expected_evolution": true,
+      "expected_reason": "title_prefix",
+      "note": "双信号同时命中时优先归因 title_prefix",
+      "title": "[evolution] CODE_HYGIENE_001"
+    },
+    {
+      "name": "title_prefix_with_labels_absent",
+      "labels": null,
+      "expected_evolution": true,
+      "expected_reason": "title_prefix",
+      "note": "标签缺失但前缀命中（竞态窗口的核心防御场景）",
+      "title": "[evolution] TEST_DUPLICATE_002"
+    },
+    {
+      "name": "plain_card_no_signals",
+      "labels": ["bug", "infra"],
+      "expected_evolution": false,
+      "expected_reason": null,
+      "note": "普通卡：原路径不受影响",
+      "title": "Fix gateway timeout handling"
+    },
+    {
+      "name": "plain_card_no_labels_no_prefix",
+      "labels": [],
+      "expected_evolution": false,
+      "expected_reason": null,
+      "note": "无任何信号的普通卡",
+      "title": "Update dependency pins"
+    }
+  ]
+}
