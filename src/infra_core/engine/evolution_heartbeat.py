@@ -1,0 +1,1222 @@
+#!/usr/bin/env python3
+"""Evolution heartbeat: observe downstream pipeline health.
+
+Independent workflow that runs every 2 hours to detect anomalies in the
+evolution scanner pipeline:
+  1. Check findings_over_time.json freshness (last snapshot too old)
+  2. Check recent evolution-found issues for PR association
+  3. Create alert issues when anomalies are detected
+"""
+
+import json
+import os
+import subprocess
+import sys
+import uuid
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
+
+# INFRA-601: gh 调用显式仓库上下文守卫（同目录 bare import，与其它引擎模块同机制）
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from evolution_utils import gh_repo_args  # noqa: E402
+
+# Heartbeat configuration
+HISTORY_PATH = Path(".evolution/findings_over_time.json")
+FRESHNESS_THRESHOLD_HOURS = 2  # Alert if no snapshot within 2 hours
+PR_CHECK_WINDOW_ISSUES = 50  # Check last N evolution-found issues
+# VAL-MIRROR-006: r1-dispatched 已派发卡的 SLA 窗口——窗口内无 PR 判黄（不 exit），
+# 超窗无 PR 判红（exit 1）。豁免由状态推出（PR 出现自动解除），无人工标签豁免。
+DISPATCH_SLA_HOURS = 48
+ALERT_LABEL = "evolution-heartbeat"
+EVOLUTION_FOUND_LABEL = "evolution-found"
+# VAL-MIRROR-006: r1-dispatched 由 scanner create_issue 打标（创建即视为派发请求），
+# heartbeat 按 SLA 分级读取该状态。标签清单双份同步（scanner ensure_labels +
+# evolution-scan.yml 内联 gh label create），改名必须三处同改。
+R1_DISPATCHED_LABEL = "r1-dispatched"
+HEARTBEAT_MARKER_PATH = Path(".evolution/heartbeat.json")
+MONITOR_HEARTBEAT_PATH = Path(".evolution/monitor_heartbeat.json")
+SCANNER_WORKFLOW_DEFAULT = "evolution-scan.yml"
+# r38 consumer-template-reconciliation: consumer repos whose scanner thin-caller
+# filename differs from the engine contract name can override via env var
+# (EVOLUTION_SCANNER_WORKFLOW, set by the evolution-heartbeat.yml reusable's
+# scanner_workflow input). Falls back to the contract default so existing
+# consumers (and the engine repo's own self-scan) are unaffected.
+SCANNER_WORKFLOW = (
+    os.environ.get("EVOLUTION_SCANNER_WORKFLOW", "").strip() or SCANNER_WORKFLOW_DEFAULT
+)
+SCANNER_LIVENESS_THRESHOLD_HOURS = 2  # Alert if scanner hasn't run in 2 hours
+# INFRA-597: successful self-heal dispatch only suppresses the alert below this
+# outage severity. Beyond it, the stale signal is no longer "cron load-shed
+# drift" but a genuine long outage — alert even if dispatch was accepted,
+# because repeated dispatch success with no new run implies systemic failure.
+SCANNER_SEVERE_STALENESS_HOURS = 8
+HEARTBEAT_WORKFLOW = "evolution-heartbeat.yml"
+HEARTBEAT_LIVENESS_THRESHOLD_HOURS = 3  # Cron is 2h; alert if no run within 3h
+# Conclusion dimension for liveness: the newest N runs all concluding "failure"
+# means the workflow is still being triggered but never succeeds — a stopped
+# pipeline, not a live one, even when createdAt is fresh. N=3 aligns with
+# GRACE_PERIOD_TICKS (evolution_utils): 1-2 consecutive failures stay inside the
+# grace window and keep the age rule.
+CONSECUTIVE_FAILURE_STALENESS = 3
+
+# --- Shared anomaly markers (producer ↔ consumer coupling) ---
+# These strings are written by create_alert_issue/_build_alert_body and parsed by
+# extract_recorded_anomalies.  Both sides MUST use the same constants to prevent
+# wording drift that would cause silent never-heal.
+_ANOMALY_SCANNER_STALE_MARKER = "evolution-scan workflow has not run recently"
+_ANOMALY_ISSUES_WITHOUT_PR_MARKER = "evolution-found issue(s) without associated PR"
+_ANOMALY_SCANNER_FAILING_MARKER = "evolution-scan workflow runs keep failing"
+_SELF_HEAL_MARKER = "自愈"  # Marker in self-heal comments to detect duplicates
+
+
+def _unique_tmp_path(final_path: Path) -> Path:
+    """Return a collision-free tmp path for atomic writes to final_path.
+
+    Fixed tmp names race across concurrent writers (see evolution_scanner):
+    mkstemp+unlink still races at thread level because the unlinked name can
+    be re-issued to another thread before the first writer recreates it.
+    pid + uuid4 names are unique per call with no existence-dependent window.
+    """
+    return final_path.parent / f"{final_path.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp"
+
+
+def check_history_freshness(
+    history_path: Path = HISTORY_PATH,
+    max_age_hours: int = FRESHNESS_THRESHOLD_HOURS,
+) -> dict[str, Any]:
+    """Check if findings_over_time.json has a recent snapshot.
+
+    Returns a dict with:
+      - stale (bool): True if the latest snapshot is older than max_age_hours
+      - age_hours (float): age in hours of the latest snapshot (inf if unknown)
+      - message (str): human-readable status
+    """
+    result: dict[str, Any] = {"stale": True, "age_hours": float("inf"), "message": ""}
+
+    if not history_path.exists():
+        result["message"] = f"History file {history_path} does not exist"
+        return result
+
+    try:
+        data = json.loads(history_path.read_text())
+    except (json.JSONDecodeError, OSError) as exc:
+        result["message"] = f"Cannot read history file: {exc}"
+        return result
+
+    snapshots = data.get("snapshots", [])
+    if not snapshots:
+        result["message"] = "History file has no snapshots"
+        return result
+
+    last_snapshot = snapshots[-1]
+    ts_str = last_snapshot.get("timestamp", "")
+    try:
+        ts = datetime.fromisoformat(ts_str)
+    except (ValueError, TypeError):
+        result["message"] = f"Cannot parse last snapshot timestamp: {ts_str!r}"
+        return result
+
+    # Ensure timezone-aware comparison
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=UTC)
+
+    now = datetime.now(UTC)
+    age_hours = (now - ts).total_seconds() / 3600
+    result["age_hours"] = age_hours
+
+    if age_hours > max_age_hours:
+        result["stale"] = True
+        result["message"] = (
+            f"findings_over_time.json is stale: last snapshot {age_hours:.1f}h ago (threshold: {max_age_hours}h)"
+        )
+    else:
+        result["stale"] = False
+        result["message"] = f"History freshness: OK ({age_hours:.1f}h old)"
+
+    return result
+
+
+def check_pr_coverage(label: str = EVOLUTION_FOUND_LABEL) -> dict[str, Any]:
+    """Check whether recent evolution-found issues have associated PRs.
+
+    VAL-MIRROR-006: r1-dispatched issues get an SLA dimension instead of the
+    plain red count — inside DISPATCH_SLA_HOURS they are yellow (excluded from
+    issues_without_pr, recorded in dispatched_within_sla), beyond it they go
+    red (dispatched_over_sla). The exemption is derived from state and clears
+    itself once a PR appears; there is no manual triage label.
+
+    Returns a dict with:
+      - issues_without_pr (int): open NON-dispatched issues lacking an
+        associated PR (r1-dispatched ones live in the SLA buckets instead)
+      - total_issues (int): total open issues inspected
+      - missing (list[int]): all issue numbers without a PR (red + yellow + dispatched)
+      - dispatched_within_sla (list[int]): r1-dispatched, no PR, SLA not elapsed (yellow)
+      - dispatched_over_sla (list[int]): r1-dispatched, no PR, SLA elapsed (red)
+      - data_ok (bool): False if gh subprocess failed; callers must NOT treat
+        issues_without_pr=0 as "anomaly cleared" when data_ok is False.
+    """
+    result: dict[str, Any] = {
+        "issues_without_pr": 0,
+        "total_issues": 0,
+        "missing": [],
+        "dispatched_within_sla": [],
+        "dispatched_over_sla": [],
+        "data_ok": True,
+    }
+
+    list_result = subprocess.run(
+        [
+            "gh",
+            "issue",
+            "list",
+            *gh_repo_args(),
+            "--label",
+            label,
+            "--state",
+            "open",
+            "--limit",
+            str(PR_CHECK_WINDOW_ISSUES),
+            "--json",
+            "number,title,createdAt,labels",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    if list_result.returncode != 0:
+        print(f"[heartbeat] Failed to query issues: {list_result.stderr.strip()}")
+        result["data_ok"] = False
+        return result
+
+    try:
+        issues = json.loads(list_result.stdout) if list_result.stdout.strip() else []
+    except json.JSONDecodeError:
+        print("[heartbeat] Cannot parse issue list JSON")
+        result["data_ok"] = False
+        return result
+
+    result["total_issues"] = len(issues)
+
+    for issue in issues:
+        number = issue["number"]
+        # Check for associated PR via 'Fixes #N' references
+        pr_result = subprocess.run(
+            [
+                "gh",
+                "pr",
+                "list",
+                *gh_repo_args(),
+                "--search",
+                f'"{number}"',
+                "--state",
+                "all",
+                "--limit",
+                "1",
+                "--json",
+                "number",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+
+        try:
+            prs = json.loads(pr_result.stdout) if pr_result.stdout.strip() else []
+        except json.JSONDecodeError:
+            prs = []
+
+        if prs:
+            # PR 出现 → SLA 豁免自动解除（无人工标签参与）
+            continue
+
+        result["missing"].append(number)
+
+        # r1-dispatched SLA 分级：已派发卡不进普通红计数，改由 SLA 维度接管
+        # （SLA 内=黄，超 SLA=红）。PR 一旦出现即从全部分桶消失（上方 continue），
+        # 豁免自动过期。
+        issue_labels = issue.get("labels") or []
+        if isinstance(issue_labels, dict):  # gh labels nodes 形态兼容
+            issue_labels = issue_labels.get("nodes", [])
+        normalized_labels: set[str] = set()
+        for lbl in issue_labels:
+            # gh 同时存在字符串数组与 {"name": ...} nodes 两种形态
+            name = lbl.get("name") if isinstance(lbl, dict) else lbl
+            if name:
+                normalized_labels.add(str(name).strip().casefold())
+
+        if R1_DISPATCHED_LABEL.strip().casefold() in normalized_labels:
+            created_str = issue.get("createdAt", "")
+            try:
+                created = datetime.fromisoformat(created_str.replace("Z", "+00:00"))
+                if created.tzinfo is None:
+                    created = created.replace(tzinfo=UTC)
+                sla_hours = (datetime.now(UTC) - created).total_seconds() / 3600
+            except (ValueError, TypeError, AttributeError):
+                # createdAt 缺失/不可解析 → 归红（fail-loud，不静默豁免）
+                result["dispatched_over_sla"].append(number)
+                continue
+            if sla_hours > DISPATCH_SLA_HOURS:
+                result["dispatched_over_sla"].append(number)
+            else:
+                result["dispatched_within_sla"].append(number)
+            continue
+
+        result["issues_without_pr"] += 1
+
+    return result
+
+
+def alert_issue_exists(label: str = ALERT_LABEL) -> bool:
+    """Check if an open heartbeat alert issue already exists (INFRA-204 dedup)."""
+    try:
+        result = subprocess.run(
+            [
+                "gh",
+                "issue",
+                "list",
+                *gh_repo_args(),
+                "--label",
+                label,
+                "--state",
+                "open",
+                "--limit",
+                "10",
+                "--json",
+                "number",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if result.returncode != 0:
+            return False
+        issues = json.loads(result.stdout) if result.stdout.strip() else []
+        return len(issues) > 0
+    except Exception:
+        return False
+
+
+def check_scanner_liveness(
+    threshold_hours: int = SCANNER_LIVENESS_THRESHOLD_HOURS,
+) -> dict[str, Any]:
+    """Check if the evolution scanner workflow has run recently.
+
+    Uses the GitHub Actions API (gh run list) to verify the scanner is alive.
+    This replaces cache-dependent file freshness checks: cross-workflow cache
+    sharing is unreliable (eviction, scope issues), causing false-positive
+    staleness alerts. Querying workflow run history is stateless and reliable.
+
+    Returns a dict with:
+      - alive (bool): True if the scanner ran within threshold_hours
+      - hours_since_last_run (float | None): age of the most recent run
+        (None if unknown — INFRA-639: probe failure or zero runs must never
+        be treated as a numeric, let alone severe, outage)
+      - last_status (str): conclusion of the most recent run
+      - message (str): human-readable status
+    """
+    return _check_workflow_liveness(SCANNER_WORKFLOW, threshold_hours)
+
+
+def check_heartbeat_workflow_liveness(
+    threshold_hours: int = HEARTBEAT_LIVENESS_THRESHOLD_HOURS,
+) -> dict[str, Any]:
+    """INFRA-588: Check if the heartbeat workflow itself has run recently.
+
+    INFRA-578 self-heal is one-directional (heartbeat → scanner). On 2026-08-27
+    the heartbeat's own cron slots were load-shed for 20+ hours AFTER it had
+    healed the scanner, leaving the whole pipeline unwatched. The scanner now
+    reverse-watches the heartbeat (see evolution_scanner.watch_heartbeat_channel);
+    this function provides the liveness probe it queries.
+
+    Returns the same shape as check_scanner_liveness.
+    """
+    return _check_workflow_liveness(HEARTBEAT_WORKFLOW, threshold_hours)
+
+
+def _check_workflow_liveness(workflow: str, threshold_hours: int) -> dict[str, Any]:
+    """Stateless workflow liveness probe via gh run list (shared implementation).
+
+    Used by both check_scanner_liveness (scanner) and
+    check_heartbeat_workflow_liveness (heartbeat reverse-watch, INFRA-588).
+
+    INFRA-639: an unknown age (gh failure / zero runs / no parseable
+    timestamps) is reported as hours_since_last_run=None with
+    liveness_data_ok=False — never float("inf"). `inf` compared numerically
+    against SCANNER_SEVERE_STALENESS_HOURS always wins, which reclassified a
+    mere probe failure as a "severe outage" and forced an alert even after a
+    successful self-heal dispatch (2026-08-30 05:54 alert "for infh").
+
+    Conclusion dimension (age-gated, INFRA-1314): when the newest
+    CONSECUTIVE_FAILURE_STALENESS runs all concluded "failure"/"timed_out"/
+    "cancelled" AND the newest run is older than threshold_hours, the workflow
+    is stale. The failure streak alone must NOT mark a fresh workflow stale:
+    a fresh-but-failing run is a data anomaly (already alertable via issue
+    coverage), not a dead pipeline. Treating it as stale made the reverse
+    watcher (INFRA-588) re-dispatch the heartbeat every scanner tick, and each
+    re-dispatched run failed again on the same open anomaly — a self-sustaining
+    dispatch ping-pong that burned ~179 no-op runs/week (2026-10 Actions budget
+    alert). A shorter history, or any non-failure conclusion
+    (success/neutral/pending/None) inside the window, keeps the pure age rule.
+    """
+    result: dict[str, Any] = {
+        "alive": True,
+        "hours_since_last_run": None,
+        "liveness_data_ok": False,
+        "last_status": "unknown",
+        "message": "",
+        # Contract: always present (False on any path that didn't evaluate a
+        # streak) so consumers never need .get() with a guessed default.
+        "conclusion_streak": False,
+    }
+    try:
+        proc = subprocess.run(
+            [
+                "gh",
+                "run",
+                "list",
+                *gh_repo_args(),
+                "--workflow",
+                workflow,
+                "--limit",
+                "5",
+                "--json",
+                "status,conclusion,createdAt",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if proc.returncode != 0:
+            result["alive"] = False
+            result["message"] = f"Cannot query scanner runs: {proc.stderr.strip()}"
+            return result
+
+        runs = json.loads(proc.stdout) if proc.stdout.strip() else []
+        if not runs:
+            result["alive"] = False
+            result["message"] = "No scanner runs found (workflow may be disabled)"
+            return result
+
+        # gh run list returns newest-first; judge the conclusion dimension on the
+        # newest window only. Any non-"failure"/"timed_out"/"cancelled" conclusion (or a shorter history)
+        # leaves the decision to the age rule below.
+        all_failed_streak = len(runs) >= CONSECUTIVE_FAILURE_STALENESS and all(
+            run.get("conclusion") in {"failure", "timed_out", "cancelled"}
+            for run in runs[:CONSECUTIVE_FAILURE_STALENESS]
+        )
+
+        now = datetime.now(UTC)
+        for run in runs:
+            created_str = run.get("createdAt", "")
+            try:
+                created = datetime.fromisoformat(created_str.replace("Z", "+00:00"))
+            except (ValueError, TypeError):
+                continue
+            age_hours = (now - created).total_seconds() / 3600
+            prev = result["hours_since_last_run"]
+            if prev is None or age_hours < prev:
+                result["hours_since_last_run"] = age_hours
+                result["last_status"] = run.get("conclusion") or run.get("status", "unknown")
+            if age_hours <= threshold_hours:
+                result["liveness_data_ok"] = True
+                # INFRA-1314 age-gate: fresh run = workflow is being triggered.
+                # A failure streak on a fresh workflow is a data anomaly, not
+                # a dead pipeline — report alive so the reverse watcher does
+                # not re-dispatch (the scheduled cron will retry on its own).
+                result["alive"] = True
+                result["conclusion_streak"] = all_failed_streak
+                if all_failed_streak:
+                    result["message"] = (
+                        f"Scanner alive by age (last run {age_hours:.1f}h ago) but newest "
+                        f"{CONSECUTIVE_FAILURE_STALENESS} runs concluded "
+                        "failure/timed_out/cancelled (data anomaly; not liveness stale)"
+                    )
+                else:
+                    result["message"] = (
+                        f"Scanner alive: last run {age_hours:.1f}h ago (status: {result['last_status']})"
+                    )
+                return result
+
+        result["alive"] = False
+        # INFRA-639: if no run had a parseable timestamp the age stays None —
+        # "stale" without a measurable duration; never fabricate a number.
+        result["liveness_data_ok"] = result["hours_since_last_run"] is not None
+        result["conclusion_streak"] = all_failed_streak  # F5: add the conclusion_streak info
+        if result["liveness_data_ok"]:
+            result["message"] = (
+                f"Scanner stale: last run {result['hours_since_last_run']:.1f}h ago "
+                f"(threshold: {threshold_hours}h, status: {result['last_status']})"
+            )
+        else:
+            result["message"] = (
+                "Scanner stale: run history unreadable (no parseable run timestamps; "
+                "probe may be failing)"
+            )
+    except Exception as exc:
+        result["alive"] = False
+        result["message"] = f"Scanner liveness check failed: {exc}"
+    return result
+
+
+# INFRA-1314: self-heal dispatch throttle. The INFRA-578/588 forward+reverse
+# self-heal loop ran unthrottled: with a persistent data anomaly making every
+# heartbeat run fail, each scanner tick re-dispatched the heartbeat, whose
+# failures kept the streak alive — 179 no-op dispatches in one week (budget
+# alert 2026-10-05). A cooldown file gates both dispatch directions: within the
+# window the dispatch is skipped as redundant (the target's own cron/queue
+# already covers retry); past it, a genuinely dead workflow can still be pulled
+# up. Per-workflow keys allow scanner/heartbeat throttling to stay independent.
+SELF_HEAL_DISPATCH_COOLDOWN_SECONDS = 6 * 3600
+_DISPATCH_THROTTLE_DIR = Path(".evolution")
+
+
+def _dispatch_throttled(workflow: str) -> bool:
+    """Return True if a dispatch of `workflow` happened within the cooldown.
+
+    State is resolved per call via ``_throttle_marker_path`` so tests can point
+    the module at a sandbox dir without re-binding these helpers.
+    """
+    marker = _throttle_marker_path(workflow)
+    try:
+        data = json.loads(marker.read_text())
+        # A valid-JSON non-object (null/list/string) is a corrupt marker, not a
+        # throttle signal — treat as not throttled instead of crashing the tick
+        # (throttle bookkeeping must never break the heal itself).
+        if not isinstance(data, dict):
+            return False
+        last = datetime.fromisoformat(data.get("timestamp", ""))
+        if last.tzinfo is None:
+            last = last.replace(tzinfo=UTC)
+        return (datetime.now(UTC) - last).total_seconds() < SELF_HEAL_DISPATCH_COOLDOWN_SECONDS
+    except (
+        AttributeError,
+        FileNotFoundError,
+        json.JSONDecodeError,
+        ValueError,
+        TypeError,
+        OSError,
+    ):
+        return False
+
+
+def _record_dispatch(workflow: str) -> None:
+    """Persist the dispatch timestamp for cooldown enforcement (best-effort)."""
+    marker = _throttle_marker_path(workflow)
+    try:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _unique_tmp_path(marker)
+        with tmp.open("w") as f:
+            json.dump({"workflow": workflow, "timestamp": datetime.now(UTC).isoformat()}, f)
+        tmp.replace(marker)
+    except OSError:
+        # Throttle bookkeeping must never break the heal itself.
+        pass
+
+
+def _throttle_marker_path(workflow: str) -> Path:
+    """Resolve the cooldown marker path against the current ``_DISPATCH_THROTTLE_DIR``.
+
+    Read dynamically so tests (and any future workspace swap) can re-point the
+    module-level dir without stale captured paths. Marker files are ephemeral
+    runner-local state: when absent (fresh checkout), the throttle simply
+    reports "not throttled" — bounded redundant dispatch, never a deadlock.
+    """
+    return _DISPATCH_THROTTLE_DIR / f"dispatch-throttle-{workflow}.json"
+
+
+def trigger_scanner_dispatch() -> tuple[bool, str | None]:
+    """Self-heal: trigger evolution-scan via workflow_dispatch (INFRA-578).
+
+    GitHub-hosted scheduled runs are load-shed at peak minutes (cron slots on
+    :00/:30 can be dropped entirely, not queued). When the heartbeat detects a
+    stale scanner, it re-triggers the scan immediately instead of waiting for
+    the next cron slot that may be dropped again.
+
+    Returns (accepted, error_detail). INFRA-722: the error detail is surfaced
+    in the alert issue body so token/permission failures (e.g. HTTP 403
+    "Resource not accessible by personal access token") are diagnosable from
+    the alert alone instead of only from run logs.
+    """
+    try:
+        if _dispatch_throttled(SCANNER_WORKFLOW):
+            print(
+                "[heartbeat] Self-heal dispatch skipped: within cooldown window "
+                f"({SELF_HEAL_DISPATCH_COOLDOWN_SECONDS}s, INFRA-1314)"
+            )
+            # INFRA-1314: throttling is the mechanism WORKING, not a dispatch
+            # failure. Return accepted=True (a heal is pending within the
+            # cooldown) and route the notice as a dedicated signal so main()
+            # neither alerts on it (INFRA-597 suppression keeps holding) nor
+            # puts it in the dispatch_error channel (INFRA-722 reserves that
+            # for API/token rejections).
+            return True, "throttled: dispatch cooldown window active"
+        proc = subprocess.run(
+            ["gh", "workflow", "run", *gh_repo_args(), SCANNER_WORKFLOW],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        print(f"[heartbeat] Scanner dispatch failed: {exc}")
+        return False, f"dispatch subprocess failed: {exc}"
+
+    if proc.returncode != 0:
+        detail = proc.stderr.strip() or f"gh workflow run exited {proc.returncode}"
+        print(f"[heartbeat] Scanner dispatch failed: {detail}")
+        return False, detail
+
+    _record_dispatch(SCANNER_WORKFLOW)
+    print(f"[heartbeat] Self-heal: dispatched {SCANNER_WORKFLOW} via workflow_dispatch")
+    return True, None
+
+
+def trigger_heartbeat_dispatch() -> bool:
+    """INFRA-588: Reverse self-heal — re-trigger evolution-heartbeat via workflow_dispatch.
+
+    Called by the scanner's watch_heartbeat_channel() when it detects the
+    heartbeat workflow's cron slots have been load-shed. Mirrors
+    trigger_scanner_dispatch (INFRA-578): dispatch failure must not crash the
+    calling tick — observability of the failure is preserved via the returned
+    flag and caller-side print.
+
+    Returns True if the dispatch was accepted by the GitHub API.
+    """
+    try:
+        if _dispatch_throttled(HEARTBEAT_WORKFLOW):
+            print(
+                "[scanner] Heartbeat dispatch skipped: within cooldown window "
+                f"({SELF_HEAL_DISPATCH_COOLDOWN_SECONDS}s, INFRA-1314)"
+            )
+            return False
+        proc = subprocess.run(
+            ["gh", "workflow", "run", *gh_repo_args(), HEARTBEAT_WORKFLOW],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        print(f"[scanner] Heartbeat dispatch failed: {exc}")
+        return False
+
+    if proc.returncode != 0:
+        print(f"[scanner] Heartbeat dispatch failed: {proc.stderr.strip()}")
+        return False
+
+    _record_dispatch(HEARTBEAT_WORKFLOW)
+    print(f"[scanner] Self-heal: dispatched {HEARTBEAT_WORKFLOW} via workflow_dispatch")
+    return True
+
+
+def check_heartbeat_marker(max_age_hours: int = FRESHNESS_THRESHOLD_HOURS) -> dict[str, Any]:
+    """Check dedicated heartbeat.json marker freshness (INFRA-204).
+
+    This is a more precise signal than findings_over_time.json: the
+    heartbeat is written at the END of a successful tick, so staleness
+    means the scanner either didn't run or failed mid-tick.
+    """
+    result: dict[str, Any] = {"stale": True, "age_hours": float("inf"), "message": ""}
+
+    if not HEARTBEAT_MARKER_PATH.exists():
+        result["message"] = f"Heartbeat marker {HEARTBEAT_MARKER_PATH} does not exist"
+        return result
+
+    try:
+        data = json.loads(HEARTBEAT_MARKER_PATH.read_text())
+        ts_str = data.get("timestamp", "")
+        if not ts_str:
+            result["message"] = "Heartbeat marker has no timestamp"
+            return result
+
+        ts = datetime.fromisoformat(ts_str)
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=UTC)
+
+        now = datetime.now(UTC)
+        age_hours = (now - ts).total_seconds() / 3600
+        result["age_hours"] = age_hours
+
+        if age_hours > max_age_hours:
+            result["stale"] = True
+            result["message"] = (
+                f"heartbeat.json is stale: last heartbeat {age_hours:.1f}h ago (threshold: {max_age_hours}h)"
+            )
+        else:
+            result["stale"] = False
+            result["message"] = f"Heartbeat marker: OK ({age_hours:.1f}h old)"
+    except (json.JSONDecodeError, ValueError, TypeError, OSError) as exc:
+        result["message"] = f"Cannot read heartbeat marker: {exc}"
+
+    return result
+
+
+def write_monitor_heartbeat(anomalies: int) -> None:
+    """Write monitor heartbeat marker for meta-monitoring (INFRA-204).
+
+    Allows the scanner's self-audit to detect if the heartbeat monitor
+    workflow itself has stopped running.
+    """
+    now = datetime.now(UTC)
+    data = {
+        "timestamp": now.isoformat(),
+        "status": "ok" if anomalies == 0 else "anomaly",
+        "anomalies_detected": anomalies,
+    }
+    MONITOR_HEARTBEAT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = _unique_tmp_path(MONITOR_HEARTBEAT_PATH)
+    with tmp.open("w") as f:
+        json.dump(data, f, indent=2)
+    tmp.replace(MONITOR_HEARTBEAT_PATH)
+
+
+def extract_recorded_anomalies(issue_body: str) -> set[str]:
+    """Parse anomaly types from an alert issue body.
+
+    Returns a set of anomaly type strings:
+    {"scanner_stale", "scanner_failing", "issues_without_pr"}.
+
+    Uses shared constants to ensure producer/consumer consistency.
+    An alert body whose every anomaly is parseable here must round-trip to the
+    same set _build_alert_body encoded (round-trip is locked by tests).
+    """
+    anomalies = set()
+    if _ANOMALY_SCANNER_STALE_MARKER in issue_body:
+        anomalies.add("scanner_stale")
+    if _ANOMALY_SCANNER_FAILING_MARKER in issue_body:
+        anomalies.add("scanner_failing")
+    if _ANOMALY_ISSUES_WITHOUT_PR_MARKER in issue_body:
+        anomalies.add("issues_without_pr")
+    return anomalies
+
+
+def compute_current_anomalies(liveness: dict[str, Any], coverage: dict[str, Any]) -> set[str]:
+    """Compute the current set of anomaly types from check results.
+
+    Returns a set of anomaly type strings:
+    {"scanner_stale", "scanner_failing", "issues_without_pr"}.
+
+    scanner_failing (age-gated failure streak, INFRA-1314): the workflow IS
+    being triggered, so it is not stale — but every recent tick concluded
+    failure/timed_out/cancelled. Without its own anomaly type this state is
+    invisible: alive=True keeps scanner_stale silent while nothing ever
+    reports the failing runs themselves. Only meaningful on an ALIVE
+    workflow: when it is already stale, the streak is part of the stale
+    story (F5) and the stale anomaly covers it — a second anomaly type
+    there would just fork duplicate alerts for one dead pipeline.
+    """
+    anomalies: set[str] = set()
+    if not liveness.get("alive", True):
+        anomalies.add("scanner_stale")
+    if liveness.get("alive") and liveness.get("conclusion_streak", False):
+        anomalies.add("scanner_failing")
+    if coverage.get("issues_without_pr", 0) > 0:
+        anomalies.add("issues_without_pr")
+    return anomalies
+
+
+def list_open_alert_issues() -> list[dict[str, Any]]:
+    """List open heartbeat alert issues with their numbers and bodies."""
+    result = subprocess.run(
+        [
+            "gh",
+            "issue",
+            "list",
+            *gh_repo_args(),
+            "--label",
+            ALERT_LABEL,
+            "--state",
+            "open",
+            "--json",
+            "number,body",
+            "--limit",
+            "50",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if result.returncode != 0:
+        print(f"[heartbeat] Failed to list open alert issues: {result.stderr.strip()}")
+        return []
+    try:
+        return json.loads(result.stdout) if result.stdout.strip() else []
+    except json.JSONDecodeError:
+        print("[heartbeat] Cannot parse open alert issues JSON")
+        return []
+
+
+def _issue_has_self_heal_comment(issue_num: int) -> bool:
+    """Check if an issue already has a self-heal comment (duplicate prevention).
+
+    Queries existing comments via `gh issue view --json comments` and checks
+    if any comment body contains the self-heal marker. Used to avoid posting
+    duplicate self-heal comments when close keeps failing across ticks.
+    """
+    try:
+        result = subprocess.run(
+            [
+                "gh",
+                "issue",
+                "view",
+                str(issue_num),
+                *gh_repo_args(),
+                "--json",
+                "comments",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if result.returncode != 0:
+            # Fail-open: if we can't query comments, proceed with posting
+            # (better to post duplicate than miss a legitimate self-heal)
+            return False
+        data = json.loads(result.stdout) if result.stdout.strip() else {}
+        comments = data.get("comments", [])
+        return any(_SELF_HEAL_MARKER in c.get("body", "") for c in comments)
+    except (json.JSONDecodeError, OSError, subprocess.TimeoutExpired):
+        # Fail-open on any error
+        return False
+
+
+def resolve_cleared_alerts(
+    current_anomalies: set[str],
+    open_alerts: list[dict[str, Any]] | None = None,
+    coverage_data_ok: bool = True,
+) -> list[int]:
+    """Close alert issues whose recorded anomalies have all cleared.
+
+    For each open alert issue, compares its recorded anomalies with the current
+    anomaly set. If ALL recorded anomalies have disappeared (none remain in current),
+    closes the issue and adds a Chinese self-heal comment listing which anomalies cleared.
+
+    Args:
+        current_anomalies: Set of currently active anomaly types
+        open_alerts: List of open alert issues (fetched if None)
+        coverage_data_ok: If False, skip self-heal entirely (fail-closed).
+            This prevents false closes when check_pr_coverage couldn't verify data.
+
+    Returns list of closed issue numbers.
+    """
+    # Fail-closed: if coverage data is unreliable, don't attempt self-heal
+    if not coverage_data_ok:
+        print("[heartbeat] Coverage data unavailable, skipping self-heal (fail-closed)")
+        return []
+
+    if open_alerts is None:
+        open_alerts = list_open_alert_issues()
+
+    if not open_alerts:
+        return []
+
+    closed: list[int] = []
+    for issue in open_alerts:
+        issue_num = issue.get("number")
+        if not issue_num:
+            continue
+
+        recorded = extract_recorded_anomalies(issue.get("body", ""))
+        if not recorded:
+            continue
+
+        # Check if all recorded anomalies have cleared
+        cleared = recorded - current_anomalies
+        if cleared and not (recorded & current_anomalies):
+            # All anomalies cleared → close the issue
+            cleared_names = sorted(cleared)  # deterministic order
+
+            # Build Chinese self-heal comment
+            anomaly_descriptions = {
+                "scanner_stale": "扫描器心跳异常（scanner stale）",
+                "scanner_failing": "扫描器连续失败（scanner failure streak）",
+                "issues_without_pr": "evolution-found issue 缺少关联 PR",
+            }
+            cleared_desc = [anomaly_descriptions.get(a, a) for a in cleared_names]
+
+            comment = "🩹 **自愈**：以下异常已消失，自动关闭此告警：\n\n" + "\n".join(
+                f"- {desc}" for desc in cleared_desc
+            )
+
+            # Check if a self-heal comment already exists (duplicate prevention)
+            # This handles the case where close failed in a previous tick but
+            # comment succeeded — avoid posting duplicate self-heal comments
+            if _issue_has_self_heal_comment(issue_num):
+                print(
+                    f"[heartbeat] Self-heal comment already exists on #{issue_num}, skipping duplicate comment"
+                )
+                # Still try to close in case previous close failed
+                close_result = subprocess.run(
+                    ["gh", "issue", "close", str(issue_num), *gh_repo_args()],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+                if close_result.returncode == 0:
+                    print(
+                        f"[heartbeat] Self-heal: closed alert #{issue_num} (cleared: {cleared_names})"
+                    )
+                    closed.append(issue_num)
+                else:
+                    print(
+                        f"[heartbeat] Failed to close #{issue_num}: {close_result.stderr.strip()}"
+                    )
+                continue
+
+            # Add self-heal comment and check return code
+            comment_result = subprocess.run(
+                [
+                    "gh",
+                    "issue",
+                    "comment",
+                    str(issue_num),
+                    *gh_repo_args(),
+                    "--body",
+                    comment,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+
+            if comment_result.returncode != 0:
+                print(
+                    f"[heartbeat] Failed to comment on #{issue_num}: {comment_result.stderr.strip()}"
+                )
+                # Don't proceed to close if comment failed (avoid orphan close)
+                continue
+
+            # Close the issue and check return code
+            close_result = subprocess.run(
+                ["gh", "issue", "close", str(issue_num), *gh_repo_args()],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+
+            if close_result.returncode != 0:
+                print(f"[heartbeat] Failed to close #{issue_num}: {close_result.stderr.strip()}")
+                # Don't add to closed list if close failed
+                continue
+
+            print(f"[heartbeat] Self-heal: closed alert #{issue_num} (cleared: {cleared_names})")
+            closed.append(issue_num)
+
+    return closed
+
+
+def _build_alert_body(
+    scanner_stale: bool,
+    issues_without_pr: int,
+    scanner_stale_hours: float | None = None,
+    dispatch_error: str | None = None,
+    dispatched_over_sla: list[int] | None = None,
+    scanner_failing: bool = False,
+) -> str:
+    """Build alert issue body using shared constants.
+
+    This function is the single source of truth for anomaly text format.
+    The text MUST be parseable by extract_recorded_anomalies() using the same
+    shared constants to prevent wording drift that would cause silent never-heal.
+
+    INFRA-722: dispatch_error (when the self-heal dispatch was rejected) is
+    appended as a plain detail line. It MUST NOT contain either anomaly marker
+    verbatim — extract_recorded_anomalies greps markers anywhere in the body,
+    so a marker inside the detail would register a phantom anomaly.
+
+    VAL-MIRROR-006: dispatched_over_sla 渲染为 issues_without_pr 标记下的分级
+    文案（超 SLA 判红）；SLA 内已派发卡属黄态，永不进入告警正文。
+    """
+    anomalies = []
+    if scanner_failing:
+        # INFRA-1314: fresh-but-failing runs are a data anomaly of their own —
+        # recorded under a dedicated marker so the per-anomaly dedup can see
+        # them (the stale marker's wording would not match this state).
+        anomalies.append(
+            f"{_ANOMALY_SCANNER_FAILING_MARKER}: newest "
+            f"{CONSECUTIVE_FAILURE_STALENESS} run(s) concluded failure/timed_out/"
+            "cancelled (workflow is still being triggered; data anomaly, not load-shed)"
+        )
+    if scanner_stale:
+        if scanner_stale_hours is not None:
+            anomalies.append(
+                f"{_ANOMALY_SCANNER_STALE_MARKER} for {scanner_stale_hours:.1f}h "
+                "(scanner may have stopped; self-heal dispatch failed or outage is severe)"
+            )
+        else:
+            # INFRA-639: unknown duration (probe failed / no run history).
+            # Never format a non-finite float here — "for infh" leaked into the
+            # 2026-08-30 alert and obscured the real trigger.
+            anomalies.append(
+                f"{_ANOMALY_SCANNER_STALE_MARKER} (duration unknown: liveness probe "
+                "returned no readable run history)"
+            )
+    if dispatched_over_sla:
+        anomalies.append(
+            f"{len(dispatched_over_sla)} dispatched issue(s) exceed "
+            f"{DISPATCH_SLA_HOURS}h dispatch SLA without a PR: "
+            f"#{' #'.join(str(n) for n in dispatched_over_sla)} "
+            f"({_ANOMALY_ISSUES_WITHOUT_PR_MARKER})"
+        )
+    if issues_without_pr > 0:
+        anomalies.append(f"{issues_without_pr} {_ANOMALY_ISSUES_WITHOUT_PR_MARKER}")
+
+    body_lines = [
+        "## Evolution Heartbeat Alert",
+        "",
+        f"**Detected**: {datetime.now(UTC).isoformat()}",
+        "",
+        "### Anomalies",
+        "",
+    ]
+    for anomaly in anomalies:
+        body_lines.append(f"- {anomaly}")
+
+    if scanner_stale and dispatch_error:
+        body_lines.append(f"- self-heal dispatch error: {dispatch_error}")
+
+    return "\n".join(body_lines)
+
+
+def create_alert_issue(
+    scanner_stale: bool,
+    issues_without_pr: int,
+    dedup_label: str = EVOLUTION_FOUND_LABEL,
+    scanner_stale_hours: float | None = None,
+    dispatch_error: str | None = None,
+    dispatched_over_sla: list[int] | None = None,
+    scanner_failing: bool = False,
+) -> bool:
+    """Create a GitHub Issue for detected pipeline anomalies.
+
+    Returns True if an issue was created, False if no anomaly or creation failed.
+    """
+    if (
+        not scanner_stale
+        and issues_without_pr == 0
+        and not dispatched_over_sla
+        and not scanner_failing
+    ):
+        return False
+
+    body = _build_alert_body(
+        scanner_stale,
+        issues_without_pr,
+        scanner_stale_hours=scanner_stale_hours,
+        dispatch_error=dispatch_error,
+        dispatched_over_sla=dispatched_over_sla,
+        scanner_failing=scanner_failing,
+    )
+    title = "[heartbeat] Pipeline anomaly detected"
+
+    create_result = subprocess.run(
+        [
+            "gh",
+            "issue",
+            "create",
+            *gh_repo_args(),
+            "--title",
+            title,
+            "--body",
+            body,
+            "--label",
+            ALERT_LABEL,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    if create_result.returncode != 0:
+        print(f"[heartbeat] Failed to create alert issue: {create_result.stderr.strip()}")
+        return False
+
+    print(f"[heartbeat] Created alert issue: {create_result.stdout.strip()}")
+    return True
+
+
+def main(history_path: Path = HISTORY_PATH) -> int:
+    """Run heartbeat checks and alert on anomalies. Returns process exit code."""
+    # Primary: scanner liveness via GitHub Actions API (stateless, no cache dependency)
+    liveness = check_scanner_liveness()
+    # INFRA-597: track whether the self-heal dispatch was accepted. A successful
+    # dispatch means a scan run was just queued (runs appear in the workflow
+    # history immediately), so the staleness signal is transient cron load-shed,
+    # not a stopped scanner. Only a failed dispatch (or a severe outage, see
+    # below) still warrants an alert issue.
+    dispatch_accepted = False
+    dispatch_error: str | None = None
+    if liveness["alive"]:
+        print(f"[heartbeat] {liveness['message']}")
+    else:
+        print(f"[heartbeat] ALERT: {liveness['message']}")
+        # INFRA-578: self-heal first — re-trigger the scanner instead of
+        # waiting for the next cron slot (peak-minute slots get load-shed).
+        dispatch_accepted, dispatch_error = trigger_scanner_dispatch()
+        if (dispatch_error or "").startswith("throttled:"):
+            # INFRA-1314: the cooldown skipping this dispatch means a heal was
+            # already dispatched within the window — observability only; it is
+            # not an API/token rejection (INFRA-722 channel) and must not
+            # become a dispatch failure downstream.
+            dispatch_error = None
+        if dispatch_accepted:
+            stale_hours = liveness.get("hours_since_last_run")
+            if stale_hours is not None and stale_hours > SCANNER_SEVERE_STALENESS_HOURS:
+                # INFRA-597: severe outage — the dispatch alone is not credible
+                # recovery (repeated dispatch success with no new run implies
+                # systemic failure). Keep the alert for human visibility.
+                print(
+                    f"[heartbeat] Severe outage ({stale_hours:.1f}h > "
+                    f"{SCANNER_SEVERE_STALENESS_HOURS}h): alerting despite successful dispatch"
+                )
+            else:
+                # INFRA-639: unknown age (stale_hours None) must NOT count as
+                # severe — a failed/empty probe is not evidence of an 8h+ outage.
+                print(
+                    "[heartbeat] Self-heal dispatch accepted; suppressing scanner_stale alert "
+                    "(transient cron load-shed, INFRA-597)"
+                )
+
+    # Advisory: file-based checks (may show stale if cache missed — NOT an alert basis)
+    heartbeat = check_heartbeat_marker()
+    print(f"[heartbeat] (advisory) {heartbeat['message']}")
+
+    freshness = check_history_freshness(history_path)
+    print(f"[heartbeat] (advisory) {freshness['message']}")
+
+    # Check 2: PR coverage
+    coverage = check_pr_coverage()
+    if not coverage.get("data_ok", True):
+        print("[heartbeat] WARNING: PR coverage check failed, data unreliable")
+        coverage.setdefault("dispatched_within_sla", [])
+        coverage.setdefault("dispatched_over_sla", [])
+    elif coverage["issues_without_pr"] > 0 or coverage.get("dispatched_over_sla"):
+        print(
+            f"[heartbeat] ALERT: {coverage['issues_without_pr']} issue(s) without PR: "
+            f"{coverage['missing']}; over SLA: {coverage.get('dispatched_over_sla', [])}"
+        )
+    elif coverage.get("dispatched_within_sla"):
+        # VAL-MIRROR-006 黄态：已派发且 SLA 内无 PR——等待中，非异常。
+        print(
+            f"[heartbeat] (yellow) {len(coverage['dispatched_within_sla'])} dispatched "
+            f"issue(s) within {DISPATCH_SLA_HOURS}h SLA awaiting PR: "
+            f"{coverage['dispatched_within_sla']}"
+        )
+    else:
+        print("[heartbeat] PR coverage: OK")
+
+    # INFRA-597: suppression condition — a successful self-heal dispatch on a
+    # non-severe outage downgrades the scanner_stale anomaly to "handled".
+    # compute_current_anomalies consumers (self-heal close, monitor marker) see
+    # the post-recovery state, matching what the next tick will observe.
+    # INFRA-639: severity requires a *measured* staleness. hours_since_last_run
+    # is None when the probe failed or found no readable run history; treating
+    # that as inf (> any threshold) forced alerts through the INFRA-597
+    # suppression even after a successful self-heal dispatch (2026-08-30).
+    measured_hours = liveness.get("hours_since_last_run")
+    severe_outage = (not liveness["alive"]) and (
+        measured_hours is not None and measured_hours > SCANNER_SEVERE_STALENESS_HOURS
+    )
+    # F5: Add conclusion_streak to the logic to ensure that failure streaks penetrate the self-heal suppression
+    failure_streak = liveness.get("conclusion_streak", False)
+    stale_alertable = not liveness["alive"] and (
+        not dispatch_accepted or severe_outage or failure_streak
+    )
+
+    # P1 self-heal: close alert issues whose anomalies have cleared
+    # INFRA-1314: conclusion_streak rides along so compute_current_anomalies
+    # sees the scanner_failing anomaly — otherwise a persisted streak alert
+    # would look "cleared" every tick and flap (close → recreate) forever.
+    effective_liveness = {
+        "alive": liveness["alive"]
+        or dispatch_accepted
+        and not severe_outage
+        and not failure_streak,
+        "conclusion_streak": liveness.get("conclusion_streak", False),
+    }
+    # 红异常 = 扫描停摆 + 连续失败 + 无 PR 红卡 + 超 SLA 已派发卡。黄态（SLA 内
+    # 已派发）不进异常集：不阻塞自愈关闭判定，也不写告警。
+    current_anomalies = compute_current_anomalies(effective_liveness, coverage)
+    if coverage.get("dispatched_over_sla"):
+        current_anomalies.add("issues_without_pr")
+    closed = resolve_cleared_alerts(
+        current_anomalies,
+        coverage_data_ok=coverage.get("data_ok", True),
+    )
+    if closed:
+        print(f"[heartbeat] Self-heal: closed {len(closed)} alert(s): {closed}")
+
+    # INFRA-204: Write monitor heartbeat for meta-monitoring
+    dispatched_over_sla = coverage.get("dispatched_over_sla", [])
+    anomaly_count = sum(
+        [stale_alertable, bool(coverage["issues_without_pr"] > 0), bool(dispatched_over_sla)]
+    )
+
+    # Create alert issue if scanner is stale/failing and NOT suppressed, or
+    # issues lack PRs (plain or beyond dispatch SLA). SLA 内已派发（黄态）不建告
+    # 警、不 exit。INFRA-1314: an age-gated failure streak on an alive scanner
+    # is alertable on its own — previously it required the workflow to ALSO go
+    # stale (i.e. the cron to stop), so a fresh-but-failing scanner never
+    # alerted at all.
+    scanner_failing = liveness["alive"] and liveness.get("conclusion_streak", False)
+    if (
+        stale_alertable
+        or scanner_failing
+        or coverage["issues_without_pr"] > 0
+        or dispatched_over_sla
+    ):
+        if alert_issue_exists():
+            # INFRA-1314 (P1 dedup): "an alert exists" is not "this anomaly is
+            # covered" — the label-level check matches ANY open alert, so a
+            # newly appearing anomaly would be silently swallowed by an
+            # existing alert tracking a different one. Compare per anomaly:
+            # only record-and-skip when every current anomaly is already in
+            # some open alert's body; a NEW anomaly falls through and gets its
+            # own alert so it is never silent.
+            recorded_anomalies: set[str] = set()
+            for open_issue in list_open_alert_issues():
+                recorded_anomalies |= extract_recorded_anomalies(open_issue.get("body", ""))
+            if not (current_anomalies - recorded_anomalies):
+                print(
+                    "[heartbeat] Open alert issue already exists and covers all current "
+                    "anomalies, skipping duplicate creation"
+                )
+                write_monitor_heartbeat(anomaly_count)
+                # INFRA-1314: a known, already-reported anomaly is not a new failure.
+                # Returning 1 here kept every scheduled tick red for days (165
+                # failing runs in one week over a single already-reported issue), which fed
+                # the conclusion-streak reverse-dispatch loop. Exit 0: the anomaly
+                # is tracked in its alert issue; the run's job (observe + report)
+                # succeeded. A probe failure (liveness_data_ok False on a stale
+                # verdict) still exits 1 below — that is genuine monitor blindness.
+                if not (stale_alertable and not liveness.get("liveness_data_ok", True)):
+                    return 0
+                return 1
+            print(
+                "[heartbeat] Existing alert does not cover new anomaly/anomalies "
+                f"{sorted(current_anomalies - recorded_anomalies)}; creating a new alert"
+            )
+        create_alert_issue(
+            scanner_stale=stale_alertable,
+            issues_without_pr=coverage["issues_without_pr"],
+            # INFRA-639: pass through the measured age only; None keeps the
+            # "duration unknown" wording and can never format as "infh".
+            scanner_stale_hours=(
+                measured_hours if stale_alertable and not liveness["alive"] else None
+            ),
+            # INFRA-722: attach the dispatch rejection detail (403 etc.) so
+            # the alert distinguishes token/permission drift from outage.
+            dispatch_error=dispatch_error,
+            dispatched_over_sla=dispatched_over_sla,
+            scanner_failing=scanner_failing,
+        )
+        write_monitor_heartbeat(anomaly_count)
+        return 1  # Non-zero exit signals a NEW anomaly to CI
+
+    write_monitor_heartbeat(anomaly_count)
+    print("[heartbeat] All checks passed")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
