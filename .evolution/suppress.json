@@ -1,0 +1,86 @@
+{
+  "suppressed": [
+    {
+      "rule_id": "ROOT_DOCS_DIR",
+      "location": "docs",
+      "expires": "2099-12-31"
+    },
+    {
+      "rule_id": "OWNERSHIP_MISSING",
+      "location": "memory/system/ownership.toml",
+      "expires": "2099-12-31"
+    },
+    {
+      "rule_id": "CODE_HYGIENE_DUPLICATE_BLOCK",
+      "location": "actions/governance-check/governance_check.py::L35 <-> src/infra_core/governance.py::L42",
+      "expires": "2027-06-30",
+      "reason": "真重复（非镜像）：两文件行号不同、判定等价而非字节一致（TestActionScriptEquivalence 锁定），mirrors.toml 字节一致清单罩不住。收敛需抽共享判定 helper 并双侧回归，记 docs/roadmap/bundled-copy-dedup-backlog.md #1。"
+    },
+    {
+      "rule_id": "CODE_HYGIENE_DUPLICATE_BLOCK",
+      "location": "src/infra_core/governance.py::L42 <-> actions/governance-check/governance_check.py::L35",
+      "expires": "2027-06-30",
+      "reason": "同上（反向遍历顺序条目）。收敛方案见 docs/roadmap/bundled-copy-dedup-backlog.md #1。"
+    },
+    {
+      "rule_id": "CODE_HYGIENE_DUPLICATE_BLOCK",
+      "location": "tests/test_sweep_pipeline_fix.py::L39 <-> tests/test_real_shell_adversarial_matrix.py::L35",
+      "expires": "2027-06-30",
+      "reason": "真重复：同源复刻的测试辅助（_extract_pipeline），收敛=抽共享测试 helper，记 docs/roadmap/bundled-copy-dedup-backlog.md #2。"
+    },
+    {
+      "rule_id": "CODE_HYGIENE_DUPLICATE_BLOCK",
+      "location": "tests/test_real_shell_adversarial_matrix.py::L35 <-> tests/test_sweep_pipeline_fix.py::L39",
+      "expires": "2027-06-30",
+      "reason": "同上（反向遍历顺序条目）。backlog #2。"
+    },
+    {
+      "rule_id": "CODE_HYGIENE_DUPLICATE_BLOCK",
+      "location": "tests/test_sweep_pipeline_fix.py::L57 <-> tests/test_real_shell_adversarial_matrix.py::L53",
+      "expires": "2027-06-30",
+      "reason": "真重复：同源复刻的测试辅助（_extract_case_guard），收敛=抽共享测试 helper，记 docs/roadmap/bundled-copy-dedup-backlog.md #2。"
+    },
+    {
+      "rule_id": "CODE_HYGIENE_DUPLICATE_BLOCK",
+      "location": "tests/test_real_shell_adversarial_matrix.py::L53 <-> tests/test_sweep_pipeline_fix.py::L57",
+      "expires": "2027-06-30",
+      "reason": "同上（反向遍历顺序条目）。backlog #2。"
+    },
+    {
+      "rule_id": "CODE_HYGIENE_DUPLICATE_BLOCK",
+      "location": "tests/test_sweep_pipeline_fix.py::L74 <-> tests/test_real_shell_adversarial_matrix.py::L70",
+      "expires": "2027-06-30",
+      "reason": "真重复：同源复刻的测试辅助（_run_extracted_guard），收敛=抽共享测试 helper，记 docs/roadmap/bundled-copy-dedup-backlog.md #2。"
+    },
+    {
+      "rule_id": "CODE_HYGIENE_DUPLICATE_BLOCK",
+      "location": "tests/test_real_shell_adversarial_matrix.py::L70 <-> tests/test_sweep_pipeline_fix.py::L74",
+      "expires": "2027-06-30",
+      "reason": "同上（反向遍历顺序条目）。backlog #2。"
+    },
+    {
+      "rule_id": "CODE_HYGIENE_DUPLICATE_BLOCK",
+      "location": "tests/test_sweep_pipeline_fix.py::L117 <-> tests/test_real_shell_adversarial_matrix.py::L113",
+      "expires": "2027-06-30",
+      "reason": "真重复：同源复刻的测试用例（test_extracted_guard_adversarial_matrix，class method），收敛=抽共享测试 helper，记 docs/roadmap/bundled-copy-dedup-backlog.md #2。"
+    },
+    {
+      "rule_id": "CODE_HYGIENE_DUPLICATE_BLOCK",
+      "location": "tests/test_real_shell_adversarial_matrix.py::L113 <-> tests/test_sweep_pipeline_fix.py::L117",
+      "expires": "2027-06-30",
+      "reason": "同上（反向遍历顺序条目）。backlog #2。"
+    },
+    {
+      "rule_id": "CODE_HYGIENE_DUPLICATE_BLOCK",
+      "location": "tests/test_trigger_release_contract.py::L44 <-> tests/test_trigger_ci_droid_routing.py::L142",
+      "expires": "2027-06-30",
+      "reason": "真重复：同源复刻的测试辅助（_make_env），收敛=抽共享测试 helper，记 docs/roadmap/bundled-copy-dedup-backlog.md #3。"
+    },
+    {
+      "rule_id": "CODE_HYGIENE_DUPLICATE_BLOCK",
+      "location": "tests/test_trigger_ci_droid_routing.py::L142 <-> tests/test_trigger_release_contract.py::L44",
+      "expires": "2027-06-30",
+      "reason": "同上（反向遍历顺序条目）。backlog #3。"
+    }
+  ]
+}
