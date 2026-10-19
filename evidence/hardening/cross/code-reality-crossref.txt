@@ -1,0 +1,33 @@
+=== LOCAL-ONE grep (should be empty) ===
+ZERO_HITS
+
+=== fail-closed grep ===
+151:    caller treats that as fail-closed.
+270:            " template face unverifiable -- fail-closed (模板不可得，接口面不可验证)"
+306:    fail_closed = (not templates) or tags_unavailable
+327:    if fail_closed:
+328:        print("FAIL: interface face unverifiable -- fail-closed (模板/tags 不可得，不得静默放行)")
+
+=== CONSECUTIVE_FAILURE grep ===
+52:# GRACE_PERIOD_TICKS (evolution_utils): 1-2 consecutive failures stay inside the
+54:CONSECUTIVE_FAILURE_STALENESS = 3
+299:    CONSECUTIVE_FAILURE_STALENESS runs all concluded "failure", the workflow is
+343:        all_failed_streak = len(runs) >= CONSECUTIVE_FAILURE_STALENESS and all(
+344:            run.get("conclusion") == "failure" for run in runs[:CONSECUTIVE_FAILURE_STALENESS]
+366:                        f"Scanner stale: last {CONSECUTIVE_FAILURE_STALENESS} runs "
+
+=== CI step order (lines 548-577) ===
+488:      checks: read          # gh api check-runs (zero-red enforcement)
+516:          # Advisory zero-red enforcement folded into advisory-bundle above:
+548:      - name: Check droid-review status
+553:          # Poll for droid-review check run (separate workflow, not a ci.yml job).
+554:          # droid-review runs as a parallel workflow (Droid Auto Review) and produces
+557:          bash scripts/check_droid_review.sh \
+576:          # Use the standalone zero-red check script
+577:          bash scripts/check_zero_red.sh "${{ github.repository }}" "$COMMIT_SHA"
+
+=== AST test file exists ===
+-rw-------@ 1 busiji  staff  9705  9月 22 21:54 tests/test_core_delivery_import_contract.py
+
+=== Step order test exists ===
+466:class TestCiOkStepOrder:
