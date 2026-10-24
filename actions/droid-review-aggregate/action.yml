@@ -1,0 +1,119 @@
+name: 'Droid Review Aggregate'
+description: >-
+  Aggregate droid-review shard findings and publish to the PR.
+  必须在 caller 仓库的本地 `droid-review` job 内运行（composite 不改 check 名），
+  这是 check 名 `droid-review` 精确契约的承载体——绝不改为 reusable workflow 调用
+  （那会产生 `droid-review / <inner>` 嵌套 check 名，杀死 check_droid_review.sh /
+  ci-ok / branch protection 的精确名匹配）。
+
+inputs:
+  github-token:
+    description: 'GitHub token for PR comments（composite 内 secrets context 不可用，由 caller 显式传入）'
+    required: true
+  pr-number:
+    description: 'PR number（来自 shards call job 输出）'
+    required: true
+  head-sha:
+    description: 'PR head SHA（inline comment 的 commit_id）'
+    required: true
+  docs-only:
+    description: "'true' 当 PR 只改 *.md（跳过发布，check 仍 success）"
+    required: true
+  shards:
+    description: '分片计划 JSON 数组或空（[] / 空 = 无分片，跳过发布）'
+    required: true
+  shards-result:
+    description: "shards call job 的 needs 结果（success/failure/...；非 success/skipped → fail-closed）"
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Check shard results
+      id: check_results
+      shell: bash
+      env:
+        DOCS_ONLY: ${{ inputs.docs-only }}
+        SHARDS: ${{ inputs.shards }}
+        SHARDS_RESULT: ${{ inputs.shards-result }}
+      run: |
+        set -euo pipefail
+
+        if [ "$DOCS_ONLY" = "true" ]; then
+          echo "docs-only PR — skipping aggregation"
+          echo "should_publish=false" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        if [ "$SHARDS" = "[]" ] || [ -z "$SHARDS" ]; then
+          echo "no shards planned — skipping aggregation"
+          echo "should_publish=false" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        # Check if the shard pipeline failed（caller 传入 needs.<call-job>.result）
+        if [ "$SHARDS_RESULT" != "success" ] && [ "$SHARDS_RESULT" != "skipped" ]; then
+          echo "::error::shard pipeline failed ($SHARDS_RESULT) — fail-closed"
+          exit 1
+        fi
+
+        echo "should_publish=true" >> "$GITHUB_OUTPUT"
+
+    - name: Download findings artifacts
+      if: steps.check_results.outputs.should_publish == 'true'
+      uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+      with:
+        # artifact 前缀契约：droid-review-debug-（watchdog quota-sweep startswith 消费）
+        pattern: droid-review-debug-${{ github.run_id }}-shard-*
+        path: findings/
+
+    - name: Resolve BASE ref (server-controlled)
+      id: resolve_base_ref
+      if: steps.check_results.outputs.should_publish == 'true'
+      shell: bash
+      env:
+        EVENT_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      run: |
+        set -euo pipefail
+        # 基线信任边界（round-2 P1）：基线条目只认服务端解析的 BASE sha
+        # （pull_request 事件上下文；workflow_dispatch 无事件上下文 → 空），
+        # GITHUB_BASE_REF 仅作分支名兜底提示，不参与 sha 解析——PR 分支
+        # 上的任何 checkout/文件都不作为条目信任源。取不到 sha → 空
+        # BASELINE_REF → 发布器空 ref=不抑制（fail-closed，绝不回落工作区）。
+        if [ -n "$EVENT_BASE_SHA" ]; then
+          echo "BASELINE_REF=$EVENT_BASE_SHA" >> "$GITHUB_OUTPUT"
+          echo "Baseline trust anchor: BASE sha $EVENT_BASE_SHA"
+        else
+          echo "BASELINE_REF=" >> "$GITHUB_OUTPUT"
+          echo "No event base sha (non-PR context) — baseline suppression disabled (fail-closed)"
+        fi
+
+    - name: Publish findings
+      if: steps.check_results.outputs.should_publish == 'true'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        PR_NUMBER: ${{ inputs.pr-number }}
+        REPOSITORY: ${{ github.repository }}
+        COMMIT_ID: ${{ inputs.head-sha }}
+        BASELINE_REF: ${{ steps.resolve_base_ref.outputs.BASELINE_REF }}
+      run: |
+        set -euo pipefail
+        # 自包含发布脚本（$GITHUB_ACTION_PATH 解析，禁止相对路径越出 action 目录）；
+        # 与 src/infra_core/engine/droid_review/publish_findings.py 字节一致
+        # （tests/test_droid_review_aggregate_action.py 锁定）。
+        # 基线信任边界（round-2 P1）：--baseline-ref 恒传（服务端 BASE sha 或
+        # 空串）；条目只从该 ref 经 gh api contents 加载，绝不读 PR 可影响的
+        # 工作区 checkout（PR 树自带伪造基线文件不得自灭 findings）；空 ref=
+        # 不抑制（fail-closed，绝不回落工作区路径）。--baseline 保留为本地/
+        # 测试语义的路径缺省载体。
+        # 递归 glob（PR #159 根因移植）：download-artifact 单 artifact 落扁平
+        # 布局 findings/findings-shard-N.json、多 artifact 才嵌套
+        # findings/<artifact-name>/……`**` 两种布局同吃，`/*` 只匹配后者
+        # （单分片 PR 发布静默为空，实证 #158 run 36284997045）。
+        python3 "$GITHUB_ACTION_PATH/publish_findings.py" \
+          --pattern "findings/**/findings-shard-*.json" \
+          --pr-number "$PR_NUMBER" \
+          --repository "$REPOSITORY" \
+          --commit-id "$COMMIT_ID" \
+          --baseline-ref "$BASELINE_REF"

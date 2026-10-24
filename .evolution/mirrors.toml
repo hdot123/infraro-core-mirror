@@ -1,0 +1,17 @@
+# 声明式镜像清单（M3，VAL-MIRROR-001）
+#
+# 自包含分发副本（composite action 在 caller 仓库运行，无法 import src/）是合法
+# 的重复代码块。此清单内的文件对在 hygiene check_duplicates 中豁免 DUPLICATE
+# 检测——豁免带保险：仅当两文件当前字节一致时生效，任一侧漂移即自动恢复检测。
+#
+# guard_test 指向锁定两副本一致性的 drift 防护测试；改动任一副本时必须双侧
+# 同步并经该测试与 PR 评审。
+#
+# 对账纪律（原子清账）：清单登记后必须同步删除 .evolution/suppress.json 中该
+# 文件对的 CODE_HYGIENE_DUPLICATE_BLOCK 条目（抑制改由豁免承担，suppress 不
+# 重复登记）；反向（删清单不删 suppress）会让下个 tick 重新滴灌 issue。
+
+[[mirrors]]
+path_a = "src/infra_core/engine/droid_review/publish_findings.py"
+path_b = "actions/droid-review-aggregate/publish_findings.py"
+guard_test = "tests/test_droid_review_aggregate_action.py::TestBundledPublishCopy"

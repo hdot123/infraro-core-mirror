@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "comment": "Adjudicated findings baseline (U2', user-approved 2026-10-22). Only findings finally adjudicated as design-intent or false-positive may be entered; real defects must never be listed. Key = path + anchor + content hash of the anchor's +-3 line window (any code change at the anchored location invalidates the entry). Maintained on main only; max 10 entries; TTL <= 90 days; every entry cites its adjudication chain. Suppressed findings stay visible in the review summary tagged [adjudicated-suppressed].",
+  "entries": [
+    {
+      "id": "qa-ok-fork-failclosed-design-pinned",
+      "path": ".github/workflows/qa.yml",
+      "anchor": "if: always() && (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'processing'))",
+      "context_sha256": "4f2453e7d009c76f5491a92be095de57dc9d812ed8ef284e12e3778b338e4d0c",
+      "context_radius": 3,
+      "severity": "P1",
+      "finding_message_pattern": "qa-ok bare always() / fork PR qa-ok red (skipped != success)",
+      "created_at": "2026-10-22",
+      "expires_at": "2027-01-20",
+      "adjudication_ref": "round-3 #5 adjudication: qa-ok bare always() + four execution legs success-only is fail-closed design, NOT a defect (relaxing skipped acceptance = zero-execution required-check fake green, #358/#372 isomorphism; a context gate on a required check = missing check instance = ruleset passes = fake green). Contract locked by test_qa_ok_fork_semantics_pinned. Re-raised round-6 shard-5 (qa.yml:323) and round-7; round-7 rejection verified in evidence/m2-round7-p1x3-verification.md #1: on a private repo fork count = 0, zero real victims, purely theoretical surface; a fork PR's red qa-ok is the CORRECT consequence of fork PRs never being mergeable (forks lack update-branch eligibility; the fork exit is not merge). The workflow line number drifts across PRs (323/325) but the anchor line content is stable."
+    }
+  ]
+}
