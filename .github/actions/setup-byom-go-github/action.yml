@@ -1,0 +1,132 @@
+name: "Setup BYOM go-github"
+description: "Write droid BYOM settings.json for the go-github AI Gateway chain (droid-review-gateway Worker -> gateway /compat + dynamic/droid-review -> opencode Go plan). CF route mode: upstream authn is held by the AI Gateway provider stored credential; the Worker strips client Authorization. Secrets enter ONLY via action inputs, never job env."
+
+inputs:
+  go-github-run-token:
+    description: "go-github AI Gateway run token (cf-aig-authorization)"
+    required: true
+  worker-ci-key:
+    description: "droid-review-gateway Worker CI_KEY (x-ci-key 门禁头，常量时间比较；空值即不发头，由 Worker 侧 401 fail-closed 兜底)"
+    required: false
+    default: ""
+  byom-model:
+    description: "BYOM model ID for droid exec (-m, matches customModels[].id)"
+    required: false
+    default: "custom:DeepSeek-V4.1-Flash-Go"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Write BYOM settings file
+      shell: bash
+      env:
+        GO_GITHUB_RUN_TOKEN: ${{ inputs.go-github-run-token }}
+        WORKER_CI_KEY: ${{ inputs.worker-ci-key }}
+        BYOM_MODEL: ${{ inputs.byom-model }}
+      run: |
+        set -euo pipefail
+        # LLM 链路（go-github，2026-09-27 F3 起 dynamic 分时路由，经 Worker 入口）：
+        # CI → https://gh.lumivane.dpdns.org（域名不变——org policy
+        # allowedBaseUrls 白名单老域名，2026-09-27 实证换原生域会被
+        # 「Model blocked by organization policy」拦，run 36283619676）
+        # → droid-review-gateway Worker（CF account 0a14f655，zone
+        # lumivane.dpdns.org 所在账号；custom domain 绑定）三合一入口层：
+        #   ① IP 门禁：GitHub Actions CIDR（KV 6h 缓存，fail-closed）∪
+        #      静态白名单（两台白名单服务器出口，明细见 cf-registry
+        #      Worker 条目）→ 403；
+        #   ② 时段标记：Mon-Fri UTC 01-04/06-10 → peak，否则 off-peak，
+        #      注入 cf-aig-metadata.time_slot；
+        #   ③ 非流式请求改写 stream=true 转发 + 聚合 SSE 回完整 JSON
+        #      （根治 /compat 统一入口 ~9s 非流式首字节墙，29×504 实证）；
+        #      流式原样透传；
+        #   ④ CI_KEY 门禁（2026-09-27 F2，三合一 → 四合一）：REQUIRE_CI_KEY=true
+        #      时 x-ci-key 缺失/不匹配 → 401 {error:"unauthorized"}（零细节
+        #      泄露，常量时间比较）；IP 门禁语义退出（GUARD_MODE=off）。
+        # Worker 下游 = CF AI Gateway「go-github」@ 0a14f655 /compat +
+        # dynamic/droid-review 动态路由（peak→mimo-v2.6-flash /
+        # off-peak→deepseek-v4.1-flash；dashboard 侧配置，Worker 零改动）。
+        # baseUrl 域名与路径保持 provider-direct 形态不变（/custom-opencode-go/v1）——
+        # 路径由 Worker 统一接管并转发 /compat，CI 侧零路径变更；
+        # guard Worker（go-github.exa.edu.kg）已于 2026-09-27 退役删除，
+        # 门禁职责由本 Worker 在同一实链入口域上承接。
+        # 完全脱离 node01 内网（Kong/new-api 均不再经过），公网直达。
+        # 链路形态（实测 2026-09-27 F3 交接探针 200 + cf-aig-cache-status MISS）：
+        #   - x-ci-key: Worker 层 CI_KEY 共享密钥（常量时间比较；REQUIRE_CI_KEY
+        #     =true 后为过 Worker 的唯一通行证，缺失/不匹配 → 401 零细节）
+        #   - cf-aig-authorization: 网关认证（run token，AI Gateway Run 权限）
+        #   - Authorization: CF 路由模式（2026-10-18 用户裁定）下由 Worker 一律
+        #     剥离、不透传——上游 provider 认证统一由 AI Gateway 端存储的
+        #     credential 承担（客户端带了也到不了 provider）。CI 侧 apiKey 仅
+        #     为满足 custom provider 必填约束的占位值，无认证语义。
+        #   - x-opencode-session: OpenCode Go 硬性要求（缺头 400
+        #     MissingSessionID），按 shard 稳定以利路由与提示词缓存
+        #   - User-Agent: 自标识编程 agent（Go 条款要求，非通用 SDK UA）
+        # 凭证只经 action inputs → step env → settings.json，不落 job env
+        # （用户裁定 2026-09-21：BYOM 配置收敛 composite action）。
+        #
+        # 合并写铁律（2026-09-21 事故）：禁止 `cat >` 整文件覆盖——同脚本在
+        # 本机/自托管环境执行时会把用户已有 customModels 全部清空。
+        # 合并语义：BYOM 条目恒占 customModels[0]（引擎脚本 fallback 与凭证
+        # 注入都读 [0]），同 id 旧条目原位替换，其余模型原样保留。
+        mkdir -p ~/.factory
+        python3 << 'PYEOF'
+        import json, os
+
+        # 模型元数据内嵌为 raw-string JSON（不带凭证；凭证只在下方注入）
+        ENTRY = json.loads(r"""
+        {
+          "customModels": [
+            {
+              "model": "dynamic/droid-review",
+              "id": "custom:DeepSeek-V4.1-Flash-Go",
+              "displayName": "DeepSeek V4.1 Flash (OpenCode Go)",
+              "baseUrl": "https://gh.lumivane.dpdns.org/custom-opencode-go/v1",
+              "apiKey": "",
+              "provider": "generic-chat-completion-api",
+              "maxOutputTokens": 65536,
+              "noImageSupport": true,
+              "extraHeaders": {}
+            }
+          ]
+        }
+        """)
+        byom = ENTRY['customModels'][0]
+        # Inject credentials + dynamic headers from step env (SHARD_ID/RUN_ID
+        # come from GITHUB_ENV of this job). KeyError here aborts BEFORE any
+        # file write, so a local dry-run without secrets never touches disk.
+        # CF 路由模式（2026-10-18 用户裁定）：上游凭证由 CF AI Gateway 端
+        # provider 存储 credential 承担，CI 不携带任何 opencode key。
+        # apiKey 仅占位（generic-chat-completion-api provider 必填非空），
+        # 值到达 Worker 即被剥离，无认证语义、无需轮换。
+        byom['apiKey'] = 'cf-route'
+        extra_headers = {
+            'cf-aig-authorization': 'Bearer ' + os.environ['GO_GITHUB_RUN_TOKEN'],
+            'x-opencode-session': 'droid-review-shard-' + os.environ.get('SHARD_ID', '0'),
+            'x-opencode-request': 'usr-droid-review-' + os.environ.get('RUN_ID', '0'),
+            'User-Agent': 'droid-ci/1.0',
+        }
+        # Worker 层 CI_KEY 门禁头（2026-09-27 F2）：REQUIRE_CI_KEY=true 后
+        # x-ci-key 是过 Worker 的唯一通行证。未配置时省略该头而非发空值——
+        # pull_request_target 读 base 定义的 with: 块，过渡窗口内 base 尚无
+        # worker-ci-key 键；缺失即不发头，由 Worker 侧 401 fail-closed 兜底
+        # （CI 侧不做二次判定，门禁单一真源 = Worker）。
+        worker_ci_key = os.environ.get('WORKER_CI_KEY', '').strip()
+        if worker_ci_key:
+            extra_headers['x-ci-key'] = worker_ci_key
+        byom['extraHeaders'] = extra_headers
+        p = os.path.expanduser('~/.factory/settings.json')
+        try:
+            d = json.load(open(p))
+        except FileNotFoundError:
+            d = {}
+        models = [m for m in d.get('customModels', []) if m.get('id') != byom['id']]
+        d['customModels'] = [byom] + models
+        json.dump(d, open(p, 'w'), indent=2)
+        print('BYOM settings merged: customModels[0]=%s (%d models total)'
+              % (byom['id'], len(d['customModels'])))
+        PYEOF
+
+    - name: Export BYOM model for engine script
+      shell: bash
+      run: |
+        echo "BYOM_MODEL=${{ inputs.byom-model }}" >> "$GITHUB_ENV"

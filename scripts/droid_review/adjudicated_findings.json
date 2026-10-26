@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "comment": "Adjudicated findings baseline (U2', user-approved 2026-10-22). Only findings finally adjudicated as design-intent or false-positive may be entered; real defects must never be listed. Key = path + anchor + content hash of the anchor's +-3 line window (any code change at the anchored location invalidates the entry). Maintained on main only; max 10 entries; TTL <= 90 days; every entry cites its adjudication chain. Suppressed findings stay visible in the review summary tagged [adjudicated-suppressed]. Note: a gate-removal refactor that replaces an anchor line re-pins the entry to the line the adjudication still governs (recompute the window hash in the same commit); the chain must record the re-adjudication.",
+  "entries": [
+    {
+      "id": "qa-ok-fork-failclosed-design-pinned",
+      "path": ".github/workflows/qa.yml",
+      "anchor": "if: always()",
+      "context_sha256": "4f4e0312b721ba22e2b54c665ec42d722c078d858efbd4bf4c52f0995cb5c738",
+      "context_radius": 3,
+      "severity": "P1",
+      "finding_message_pattern": "deterministic red qa-ok/qa-ok aggregator/fork pr",
+      "created_at": "2026-10-22",
+      "expires_at": "2027-01-20",
+      "adjudication_ref": "round-3 #5 adjudication: qa-ok bare always() + four execution legs success-only is fail-closed design, NOT a defect (relaxing skipped acceptance = zero-execution required-check fake green, #358/#372 isomorphism; a context gate on a required check = missing check instance = ruleset passes = fake green). Contract locked by test_qa_ok_fork_semantics_pinned. Re-raised round-6 shard-5 (qa.yml:323) and round-7; round-7 rejection verified in evidence/m2-round7-p1x3-verification.md #1: on a private repo fork count = 0, zero real victims, purely theoretical surface; a fork PR's red qa-ok is the CORRECT consequence of fork PRs never being mergeable (forks lack update-branch eligibility; the fork exit is not merge). The workflow line number drifts across PRs (323/325) but the anchor line content is stable. Re-adjudicated 2026-10-23 (merge of #375 into base 5446f47): PR #375 gate-removal replaced the anchor line (processing label context gate) with the bare 'if: always()' it was always adjudicating (the adjudicated defect is qa-ok's bare always() + success-only legs, not the removed label gate); anchor re-pinned to the surviving bare always() aggregation line, ±3 window hash recomputed (line 323 in merged tree). Fail-closed rationale and fork rejection unchanged. Re-adjudicated 2026-10-23 again (round-10, run 39929166202 @ c775320): fourth re-elevation at qa.yml:323 with identical bare always() anchor and window hash (c775320 touched auto-merge-pipeline/droid-review/plan_shards/triage, not qa.yml — verified hash e05aeda8* unchanged); round-10 no-hits against the old main copy were the designed dual-tree mismatch (main still pinned the pre-#375 processing-label anchor), resolved by this PR carrying the re-pinned entry. Rationale unchanged; message pattern extended to also cover the round-10 shard-5 phrasing (fragments 'deterministic red qa-ok', 'qa-ok aggregator', 'fork pr')."
+    }
+  ]
+}

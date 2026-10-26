@@ -1,0 +1,24 @@
+[1m============================= test session starts ==============================[0m
+platform darwin -- Python 3.12.13, pytest-9.1.1, pluggy-1.6.0 -- ~/infraro-core/.venv/bin/python
+cachedir: .pytest_cache
+rootdir: ~/infraro-core
+configfile: pyproject.toml
+plugins: cov-7.1.0, xdist-3.8.0, timeout-2.4.0
+timeout: 300.0s
+timeout method: signal
+timeout func_only: False
+[1mcollecting ... [0mcollected 10 items
+
+tests/test_gate1_fail_closed.py::TestTemplatesUnavailable::test_templates_unavailable_fails_closed [32mPASSED[0m[32m [ 10%][0m
+tests/test_gate1_fail_closed.py::TestTemplatesUnavailable::test_no_local_one_soft_pass_remains [32mPASSED[0m[32m [ 20%][0m
+tests/test_gate1_fail_closed.py::TestTagsUnavailable::test_tags_unavailable_with_pinned_v_ref_fails_closed [32mPASSED[0m[32m [ 30%][0m
+tests/test_gate1_fail_closed.py::TestTagsUnavailable::test_tags_unavailable_without_pinned_refs_stays_green [32mPASSED[0m[32m [ 40%][0m
+tests/test_gate1_fail_closed.py::TestDeadReferenceSweep::test_dead_ref_reported_when_tags_available [32mPASSED[0m[32m [ 50%][0m
+tests/test_gate1_fail_closed.py::TestDeadReferenceSweep::test_registered_stock_token_keeps_owned_exit_zero [32mPASSED[0m[32m [ 60%][0m
+tests/test_gate1_fail_closed.py::TestDeadReferenceSweep::test_multiple_registered_templates_all_owned [32mPASSED[0m[32m [ 70%][0m
+tests/test_gate1_fail_closed.py::TestTemplateResolution::test_local_sibling_stack_layout_is_read [32mPASSED[0m[32m [ 80%][0m
+tests/test_gate1_fail_closed.py::TestTemplateResolution::test_public_tarball_fallback_needs_no_credentials [32mPASSED[0m[32m [ 90%][0m
+tests/test_gate1_fail_closed.py::TestTemplateResolution::test_unverifiable_sources_yield_empty [32mPASSED[0m[32m [100%][0m
+
+[32m============================== [32m[1m10 passed[0m[32m in 0.17s[0m[32m ==============================[0m
+Exit code: 0
