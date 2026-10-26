@@ -1,0 +1,32 @@
+{
+  "suppressed": [
+    {
+      "rule_id": "ROOT_DOCS_DIR",
+      "location": "docs",
+      "expires": "2099-12-31"
+    },
+    {
+      "rule_id": "OWNERSHIP_MISSING",
+      "location": "memory/system/ownership.toml",
+      "expires": "2099-12-31"
+    },
+    {
+      "rule_id": "CODE_HYGIENE_DUPLICATE_BLOCK",
+      "location": "actions/governance-check/governance_check.py <-> src/infra_core/governance.py",
+      "expires": "2027-06-30",
+      "reason": "真重复（非镜像）：两文件行号不同、判定等价而非字节一致（TestActionScriptEquivalence 锁定），mirrors.toml 字节一致清单罩不住。收敛需抽共享判定 helper 并双侧回归，记 docs/roadmap/bundled-copy-dedup-backlog.md #1。（NF-1 归一化：原带行号双向 2 条合并为文件对 1 条）"
+    },
+    {
+      "rule_id": "CODE_HYGIENE_DUPLICATE_BLOCK",
+      "location": "tests/test_real_shell_adversarial_matrix.py <-> tests/test_sweep_pipeline_fix.py",
+      "expires": "2027-06-30",
+      "reason": "真重复：同源复刻的测试辅助（_extract_pipeline/_extract_case_guard/_run_extracted_guard/test_extracted_guard_adversarial_matrix），收敛=抽共享测试 helper，记 docs/roadmap/bundled-copy-dedup-backlog.md #2。（NF-1 归一化：原 4 函数×行号×双向 8 条合并为文件对 1 条）"
+    },
+    {
+      "rule_id": "CODE_HYGIENE_DUPLICATE_BLOCK",
+      "location": "tests/test_trigger_ci_droid_routing.py <-> tests/test_trigger_release_contract.py",
+      "expires": "2027-06-30",
+      "reason": "真重复：同源复刻的测试辅助（_make_env），收敛=抽共享测试 helper，记 docs/roadmap/bundled-copy-dedup-backlog.md #3。（NF-1 归一化：原带行号双向 2 条合并为文件对 1 条）"
+    }
+  ]
+}

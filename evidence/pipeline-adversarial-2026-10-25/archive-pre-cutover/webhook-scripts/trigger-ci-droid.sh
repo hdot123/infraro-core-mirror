@@ -1,0 +1,981 @@
+#!/bin/bash
+# shellcheck disable=SC1091,SC2317,SC2054,SC2155,SC2329,SC2034
+# trigger-ci-droid.sh — CI complete webhook → Sessions API 注入当前 session
+# 由 adnanh/webhook 调用，立即返回 200，通过 Sessions API 注入消息到运行中的 session
+#
+# 机制：POST /api/v0/sessions/{session_id}/messages with computerId 路由到本地 daemon
+# 参照：trigger-error-droid.sh 的异步模式和 fingerprint lock
+
+set -uo pipefail
+
+# === PostHog 事件上报 (lib/posthog.sh 统一实现) ===
+POSTHOG_EVENT_NAME="ci_webhook_failure"
+POSTHOG_DISTINCT_ID="ci-webhook"
+# shellcheck source=/dev/null
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/posthog.sh"
+# shellcheck source=/dev/null
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/p0a-guard.sh"
+# 路径 G 演化守卫（owner 2026-10-04 裁定 a）：R1 派发 PR 的 fallback 自动修复拦截
+# shellcheck source=/dev/null
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/evolution-guard.sh"
+
+# === 参数 ===
+PR_NUMBER="${1:-}"
+BRANCH="${2:-}"
+SHA="${3:-}"
+STATUS="${4:-}"
+# 第 5 参数（可选）：GitHub repo slug（owner/name），来自 CI payload 的 repo 字段。
+# INFRA-701：hooks.json ci-complete 钩子透传 payload.repo，用于 fallback 路由
+# 消除 PR 号跨仓撞号误路由（infra-core PR #136 被派到 memory 仓的 7 月旧 PR #136）。
+REPO_SLUG_ARG="${5:-${CI_REPO:-}}"
+
+# === 配置（VAL-INJ-010: LOG_FILE 赋值先于任何 send_posthog_event）===
+WEBHOOK_BASE="${WEBHOOK_BASE:-${HOME}/.factory/webhook}"
+LOG_DIR="${WEBHOOK_BASE}/logs"
+LOCK_DIR="${LOCK_DIR:-${WEBHOOK_BASE}/locks}"
+SESSIONS_INDEX="${SESSIONS_INDEX:-${HOME}/.factory/sessions-index.json}"
+PYTHON_BIN="${PYTHON_BIN:-/opt/homebrew/bin/python3}"
+# 跨平台 flock 解析：优先 PATH 中的 flock（Linux CI runner 为 /usr/bin/flock），
+# 无 PATH 命中时回退 macOS Homebrew 路径。硬编码 /opt/homebrew 会使非 macOS
+# 主机上 flock 执行失败（127），被幂等锁分支误判为 ci_lock_held 而静默跳过。
+FLOCK_BIN="${FLOCK_BIN:-$(command -v flock || echo /opt/homebrew/bin/flock)}"
+
+# VAL-INJ-010: 提前赋值 LOG_FILE，确保 ci_invalid_pr_number 事件回执落盘
+TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+LOG_FILE="${LOG_DIR}/ci-complete-pr${PR_NUMBER:-unknown}-${TIMESTAMP}.log"
+mkdir -p "$LOG_DIR" 2>/dev/null
+
+# PR_NUMBER 前置校验（必须在路径拼接前）
+if [[ ! "$PR_NUMBER" =~ ^[1-9][0-9]*$ ]]; then
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: Invalid PR_NUMBER='$PR_NUMBER' (must match ^[1-9][0-9]*$)"
+  send_posthog_event "ci_invalid_pr_number" "${PR_NUMBER:-empty}" "validation" "format_error"
+  exit 0
+fi
+
+# === 配置（后续字段依赖 PR_NUMBER 合法性）===
+PENDING_CI_FILE="${LOCK_DIR}/pending-ci-${PR_NUMBER}.json"
+
+# Cross-platform mtime (macOS stat -f %m / GNU stat -c %Y)
+# Conditional assignment avoids GNU stdout leak into $() capture
+# (GNU stat treats -f as --file-system, leaking fs-listing stdout)
+_portable_mtime() {
+    local _f="$1" _ts
+    if ! _ts=$(stat -f %m "$_f" 2>/dev/null); then
+        _ts=$(stat -c %Y "$_f" 2>/dev/null || echo 0)
+    fi
+    printf '%s' "$_ts"
+}
+
+# === INFRA-701: repo slug → 本地路径解析 ===
+# 输入: GitHub repo slug（owner/name）。查询 ~/.factory/config/repositories.yml
+# 的 githubRepo 字段反解 repoPath。找到且目录存在 → 输出本地路径；否则输出空串。
+# 解析失败一律返回空（调用方回退到后续优先级），不阻塞 fallback 记录。
+REPO_CONFIG="${REPO_CONFIG:-$HOME/.factory/config/repositories.yml}"
+SCRIPT_CWD="$(pwd)"
+resolve_repo_path() {
+    local slug="$1"
+    if [ -z "$slug" ] || [ ! -f "$REPO_CONFIG" ]; then
+        return
+    fi
+    "$PYTHON_BIN" - "$slug" "$REPO_CONFIG" <<'PYEOF' 2>/dev/null
+import sys
+slug, config_path = sys.argv[1], sys.argv[2]
+try:
+    import yaml
+except ImportError:
+    sys.exit(0)
+try:
+    with open(config_path) as f:
+        cfg = yaml.safe_load(f) or {}
+    for team in (cfg.get("teams") or {}).values():
+        for repo in team.get("repos") or []:
+            if (repo.get("githubRepo") or "") == slug:
+                path = repo.get("repoPath") or ""
+                if path.startswith("~/"):
+                    import os
+                    path = os.path.expanduser(path)
+                print(path)
+                sys.exit(0)
+except Exception:
+    pass
+PYEOF
+}
+
+# === M1-D（v3.2.2 C3）：执行体已删 ===
+# 超时包装器（前名含 timeout 字样）与 fallback droid 派发随 VAL-M1-008 一并移除
+# （结构断言：全文不得再含该包装器名与执行启动字样）。
+# 探活端点实测结论（2026-08-20 实测：GET /api/v0/sessions/{id} 端点存在且可用，
+# 死会话返回 JSON 404 "Session does not exist" 而非路由级 HTML 404）——该结论
+# 曾记录在已删的 fallback prompt 区，现归档于本注释。
+notify_fallback() {
+  local pr_num="$1"
+  local ci_status="$2"
+  local pending_file="${LOCK_DIR}/pending-ci-${pr_num}.json"
+
+  # 路径 G 演化守卫（owner 2026-10-04 裁定 a，VAL-GATE-020）：
+  # context 阳性含 r1-evolution → 不记录不告警递进（修补唯一入口=人工重打
+  # r1-cleared 过闸）；阴性/文件缺失/损坏（不可判定）→ 照常记录。
+  _evolution_guard_run "$pending_file"
+  if [ "$EVOLUTION_GUARD_RESULT" = "halt_evolution" ]; then
+    _evolution_guard_alert "ci_fallback_evolution_blocked" "$pr_num"
+    # 审计保真：halt 不得留下「fallback 已发生」的假观感，也不得误挡后续
+    # 合法（人工重打 r1-cleared）判定——清除 60min 去重锁。
+    rm -f "${LOCK_DIR}/ci-fallback-${pr_num}.lock"
+    return 0
+  fi
+
+  # P0-A 源感知守卫（记录前三查；M1-D 起开枪面已删，守卫语义保留在记录面）：
+  # ① PR 评论含 <!-- droid-autofix-attempt-N --> sentinel → 让路
+  # ② pending-ci source=runner → 静默通过（runner 自己管）
+  # ③ AUTOFIX_AUTO_ENABLED=true 且非 runner → 降级为告警不记录
+  local source=""
+  if [ -f "$pending_file" ]; then
+    source=$("$PYTHON_BIN" -c "import json,sys; print(json.load(open(sys.argv[1])).get('source',''))" "$pending_file" 2>/dev/null || echo "")
+  fi
+  _p0a_guard_run "$pr_num" "$source" "$REPO_SLUG_ARG"
+  case "$P0A_GUARD_RESULT" in
+    silent_runner)
+      log "P0-A 守卫：PR #${pr_num} source=runner，静默通过（runner 自己管）"
+      return 0
+      ;;
+    yield_sentinel)
+      log "P0-A 守卫：PR #${pr_num} 检测到 autofix sentinel，让路不记录"
+      return 0
+      ;;
+    alert_only)
+      log "P0-A 守卫：PR #${pr_num} AUTOFIX_AUTO_ENABLED=true 且非 runner，降级为告警"
+      return 0
+      ;;
+    proceed)
+      # 继续执行记录逻辑
+      ;;
+  esac
+
+  # M1-D（v3.2.2 C3，VAL-M1-008）：Mac 腿纯通知——本函数只记录不派发。
+  # 合并/修复由 GitHub 侧守卫腿（auto-merge pipeline，REST 三门绿判唯一入口）
+  # 与 runner droid-autofix 负责；Mac 侧零执行体、零合并语义。
+  # 注入失败（4xx/5xx/探活死亡/无 pending）= 通知面缺失，记录即终态：
+  # CI 状态以 GitHub REST check-runs 为准，守卫腿按实时状态推进。
+  # repo 路由观测面（INFRA-701）：记录里带 repo 解析结果（PENDING_CWD 优先），
+  # 防跨仓撞号误路由回归——仅审计用，不再据此派发。
+  local repo_observed="${3:-}"
+  log "FALLBACK: notify-suppressed for PR #${pr_num} (status: ${ci_status}, repo: ${repo_observed:-unknown}) — Mac leg is notify-only; merging is owned by the guard leg"
+}
+
+# INFRA-701: fallback repo 观测优先级（M1-D 起仅用于 notify-suppressed 审计记录）：
+#   1. PENDING_CWD（pending-ci 文件携带，发 PR 会话的确切仓库路径，最权威）
+#   2. 显式 repo slug 解析（CI payload repo 字段，经 repositories.yml 反查本地路径）
+#   3. SCRIPT_CWD（webhook 接收器的 command-working-directory，最后兜底）
+# 注意：本函数在 $( ) 命令替换中调用，log() 的 tee 已重定向 stderr，
+# 不会污染命令替换捕获的返回值。
+pick_fallback_repo() {
+    if [ -n "${PENDING_CWD:-}" ]; then
+        echo "$PENDING_CWD"
+        return
+    fi
+    if [ -n "$REPO_SLUG_ARG" ]; then
+        local resolved
+        resolved=$(resolve_repo_path "$REPO_SLUG_ARG")
+        if [ -n "$resolved" ] && [ -d "$resolved" ]; then
+            log "Fallback repo routed by CI payload repo slug: $REPO_SLUG_ARG -> $resolved"
+            echo "$resolved"
+            return
+        fi
+        log "WARN: repo slug '$REPO_SLUG_ARG' not resolvable via $REPO_CONFIG, falling back to $SCRIPT_CWD"
+    fi
+    echo "$SCRIPT_CWD"
+}
+
+# 1Password 配置
+OP_ITEM_ID="d2da72sb27xfvekt6sbqag36zq"
+OP_FIELD_LABEL="api"
+
+# Factory Sessions API 配置
+FACTORY_API_BASE="${FACTORY_API_BASE:-https://api.factory.ai/api/v0}"
+COMPUTER_ID="d6cf2cd1-a7b8-4aad-a71f-ca89c90d2c33"
+
+# === 日志 ===
+# VAL-INJ-010: LOG_FILE 已在文件顶部提前赋值（在 PR_NUMBER 校验之前）
+# 这里只定义 log 函数
+
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG_FILE" >&2; }
+
+# === 参数验证 ===
+if [ -z "$PR_NUMBER" ]; then
+    mkdir -p "$LOG_DIR" 2>/dev/null
+    log "ERROR: PR_NUMBER parameter is empty"
+    send_posthog_event "ci_empty_pr_number" "none" "validation" "PR_NUMBER parameter empty"
+    exit 0
+fi
+
+log "=== trigger-ci-droid.sh started ==="
+log "PR_NUMBER=$PR_NUMBER BRANCH=$BRANCH SHA=$SHA STATUS=$STATUS REPO=${REPO_SLUG_ARG:-none}"
+
+# === 检查 pending-ci-{PR_NUMBER}.json ===
+if [ ! -f "$PENDING_CI_FILE" ]; then
+    log "WARN: pending-ci-${PR_NUMBER}.json not found at $PENDING_CI_FILE"
+    # PR-based ephemeral lock (60min TTL) to prevent duplicate notify records on webhook retries
+    FALLBACK_LOCK="${LOCK_DIR}/ci-fallback-${PR_NUMBER}.lock"
+    mkdir -p "$LOCK_DIR" 2>/dev/null
+    if [ -f "$FALLBACK_LOCK" ]; then
+        FALLBACK_LOCK_AGE_SEC=$(( $(date +%s) - $(_portable_mtime "$FALLBACK_LOCK") ))
+        if [ "$FALLBACK_LOCK_AGE_SEC" -lt 0 ]; then FALLBACK_LOCK_AGE_SEC=0; fi
+        FALLBACK_LOCK_AGE=$(( FALLBACK_LOCK_AGE_SEC / 60 ))
+        if [ "$FALLBACK_LOCK_AGE" -gt 1440 ]; then FALLBACK_LOCK_AGE=1440; fi
+        if [ "$FALLBACK_LOCK_AGE" -lt 60 ]; then
+            log "SKIP: Fallback already triggered for PR #${PR_NUMBER} (lock age: ${FALLBACK_LOCK_AGE}min < 60min)"
+            exit 0
+        else
+            log "WARN: Stale fallback lock (${FALLBACK_LOCK_AGE}min > 60min), removing and proceeding"
+            rm -f "$FALLBACK_LOCK"
+        fi
+    fi
+    echo "$TIMESTAMP" > "$FALLBACK_LOCK" || {
+        log "ERROR: Failed to write fallback lock $FALLBACK_LOCK"
+        send_posthog_event "ci_fallback_lock_write_failed" "$PR_NUMBER" "fallback_lock" "missing-pending-ci path"
+    }
+    log "Created fallback lock: $FALLBACK_LOCK"
+    # INFRA-701: 无 pending 文件时 PENDING_CWD 为空，走 slug 解析或 SCRIPT_CWD 兜底
+    notify_fallback "$PR_NUMBER" "${STATUS:-unknown}" "$(pick_fallback_repo)"
+    exit 0
+fi
+
+log "Reading pending-ci-${PR_NUMBER}.json..."
+
+# 读取 session_id、pr_number、created_at 和 cwd（从 pending-ci-{PR_NUMBER}.json）
+# M5: session_id is now optional (new schema: {pr_number, cwd, created_at})
+# Old schema with session_id still works (backward compat)
+#
+# INFRA-527 修复：空 session_id 占位符
+# 旧实现按 `{session_id} {pr_number} ...` 单行拼接，session_id 为空时 python 输出
+# 前导空格，bash read 的 IFS 默认剥离所有空白，导致字段整体左移错位：
+# SESSION_ID=pr_number、PENDING_PR=created_at —— 新 schema 100% 误报 ci_pr_mismatch。
+# 占位符 "-" 保证 read 永远对齐 4 个字段，随后归一化为空字符串。
+read -r SESSION_ID PENDING_PR CREATED_AT PENDING_CWD < <($PYTHON_BIN -c "
+import json, sys
+try:
+    with open('$PENDING_CI_FILE') as f:
+        data = json.load(f)
+    session_id = data.get('session_id') or '-'  # M5: null/missing → placeholder keeps read aligned
+    pr_number = data.get('pr_number', '-')
+    created_at = data.get('created_at', '-')
+    cwd = data.get('cwd', '-')
+    print(f'{session_id} {pr_number} {created_at} {cwd}')
+except Exception as e:
+    print(f'ERROR: {e}', file=sys.stderr)
+    print('- - - -')
+" 2>>"$LOG_FILE")
+
+# Normalize placeholders to empty (missing optional fields keep legacy behavior)
+[ "$SESSION_ID" = "-" ] && SESSION_ID=""
+[ "$CREATED_AT" = "-" ] && CREATED_AT=""
+[ "$PENDING_CWD" = "-" ] && PENDING_CWD=""
+
+# Check for corrupted JSON (parser failed to extract any fields)
+if [ -z "$PENDING_PR" ] || [ "$PENDING_PR" = "-" ]; then
+    # 路径 G 演化守卫：quarantine 的 mv 会移走文件，先判定再隔离，
+    # 防 round-1 P1 同类绕过（JSON 主体损坏但 context 仍可独立读取时阳性生效；
+    # 彻底不可解析 → 守卫 fail-open proceed，与既有语义一致）。
+    _evolution_guard_run "$PENDING_CI_FILE"
+    if [ "$EVOLUTION_GUARD_RESULT" = "halt_evolution" ]; then
+        mv "$PENDING_CI_FILE" "${PENDING_CI_FILE}.corrupted.$(date +%s)"
+        _evolution_guard_alert "ci_fallback_evolution_blocked_corrupted" "$PR_NUMBER"
+        exit 0
+    fi
+    log "ERROR: Failed to parse pending-ci JSON — quarantining corrupted file"
+    mv "$PENDING_CI_FILE" "${PENDING_CI_FILE}.corrupted.$(date +%s)"
+    send_posthog_event "ci_corrupted_json" "$PR_NUMBER" "parse" "JSON parse failed"
+    notify_fallback "$PR_NUMBER" "${STATUS:-unknown}" "$(pick_fallback_repo)"
+    exit 0
+fi
+
+# === PR 号校验 ===
+if [ "$PENDING_PR" != "$PR_NUMBER" ]; then
+    log "ERROR: PR number mismatch! File contains PR #$PENDING_PR but webhook triggered for PR #$PR_NUMBER"
+    send_posthog_event "ci_pr_mismatch" "$PR_NUMBER" "pr_validation" "file=$PENDING_PR arg=$PR_NUMBER"
+    exit 0
+fi
+
+# === M2 F7: SHA 参数校验（幂等键组成部分，缺失/畸形时降级为 nosha 不拦截）===
+# CI payload 对 sha 的取值是 commit SHA；异常输入只影响幂等键区分度，不应阻断通知。
+if [ -n "$SHA" ] && ! [[ "$SHA" =~ ^[a-zA-Z0-9._-]+$ ]]; then
+    log "WARN: SHA failed sanity check, treating as nosha for idempotency key (SHA='$SHA')"
+    SHA=""
+fi
+
+# === M2 F7 ①: per-SHA 幂等（先于任何注入/路由决策）===
+# 同 session+pr+sha 的重复 CI 事件（webhook 重试/重复投递）直接整体跳过：不探活、
+# 不注入、不改写 pending 审计字段。状态条目仅由成功注入后写入（见成功路径），
+# 崩溃窗口语义：宁可重复注入，不可丢审计。PR_SHA_STATE_DIR 可覆盖（测试沙箱）。
+PR_SHA_STATE_DIR="${PR_SHA_STATE_DIR:-${LOCK_DIR}/pr-sha}"
+mkdir -p "$PR_SHA_STATE_DIR" 2>/dev/null
+sanitize_state_key() {
+    printf '%s' "$1" | /usr/bin/sed 's/[^a-zA-Z0-9._-]/-/g'
+}
+SHA_STATE_FILE="${PR_SHA_STATE_DIR}/ci-complete-sha-$(sanitize_state_key "${SESSION_ID:-rebinding}")-$(sanitize_state_key "$PR_NUMBER")-$(sanitize_state_key "${SHA:-nosha}").json"
+if [ -f "$SHA_STATE_FILE" ]; then
+    log "SKIP: Duplicate CI event for same SHA (session=${SESSION_ID:-rebinding} pr=$PR_NUMBER sha=${SHA:-nosha})"
+    send_posthog_event "ci_duplicate_sha_event" "$PR_NUMBER" "dedup" "sha=${SHA:-nosha} session=${SESSION_ID:-null} already injected"
+    exit 0
+fi
+
+# === F1: Extract source field for routing ===
+PENDING_SOURCE=$($PYTHON_BIN -c "
+import json, sys
+try:
+    with open('$PENDING_CI_FILE') as f:
+        data = json.load(f)
+    print(data.get('source', ''))
+except Exception as e:
+    print('', file=sys.stderr)
+    print('')
+" 2>>"$LOG_FILE")
+
+# === F1: Weak cross-validation for scanner source ===
+# VAL-REG-007: Verify scanner identity via gh pr view (author/labels)
+# Returns: 0=pass, 1=mismatch, 2=unexecutable (gh unavailable/failed)
+verify_scanner_identity() {
+    local pr_num="$1"
+
+    # Check if gh CLI is available
+    if ! command -v gh &>/dev/null; then
+        log "WARN: gh CLI not available for scanner cross-validation"
+        return 2
+    fi
+
+    # Derive owner/repo from PENDING_CWD for -R flag (VAL-REG-007 fix: without -R,
+    # gh falls back to CWD which is not the PR's repo, so verification always fails)
+    local repo_slug=""
+    if [[ -n "$PENDING_CWD" && -d "$PENDING_CWD/.git" ]]; then
+        repo_slug=$(git -C "$PENDING_CWD" remote get-url origin 2>/dev/null | \
+            sed -E 's#^https://[^/]+/##; s#^git@[^:]+:##; s#\.git$##' || true)
+    fi
+    local repo_flag=""
+    if [[ -n "$repo_slug" ]]; then
+        repo_flag="-R $repo_slug"
+        log "DEBUG: verify_scanner_identity using repo=$repo_slug (from PENDING_CWD)"
+    else
+        log "WARN: Could not derive repo from PENDING_CWD='$PENDING_CWD', gh pr view may fail"
+    fi
+
+    # Fetch PR metadata (author + labels)
+    local pr_data
+    # shellcheck disable=SC2086  # repo_flag is intentionally unquoted (empty or "-R owner/repo")
+    if ! pr_data=$(gh pr view "$pr_num" $repo_flag --json author,labels 2>&1); then
+        log "WARN: gh pr view failed for PR #$pr_num: $pr_data"
+        return 2
+    fi
+
+    # Extract author login
+    local author
+    author=$($PYTHON_BIN -c "
+import json, sys
+try:
+    data = json.loads('''$pr_data''')
+    print(data.get('author', {}).get('login', ''))
+except:
+    print('')
+" 2>>"$LOG_FILE")
+
+    # Check for scanner-related labels (e.g., "scanner", "evolution-scanner")
+    local has_scanner_label
+    has_scanner_label=$($PYTHON_BIN -c "
+import json, sys
+try:
+    data = json.loads('''$pr_data''')
+    labels = [l.get('name', '').lower() for l in data.get('labels', [])]
+    print('yes' if any('scanner' in l for l in labels) else 'no')
+except:
+    print('no')
+" 2>>"$LOG_FILE")
+
+    # Heuristic: author must be a bot/automation account OR PR must have scanner label
+    # For now, accept any PR that either has scanner label or is authored by known bot accounts
+    if [ "$has_scanner_label" = "yes" ]; then
+        log "Scanner identity verified: PR #$pr_num has scanner-related label"
+        return 0
+    fi
+
+    # Check for known scanner/bot accounts (placeholder - expand as needed)
+    case "$author" in
+        *scanner*|*bot*|*automation*|github-actions|evolution[bot])
+            log "Scanner identity verified: PR #$pr_num authored by $author (bot account)"
+            return 0
+            ;;
+    esac
+
+    # Mismatch: PR doesn't look like it came from scanner
+    log "WARN: Scanner cross-validation failed for PR #$pr_num (author=$author, scanner_label=$has_scanner_label)"
+    return 1
+}
+
+# === F1: Source-based routing ===
+# VAL-REG-005/006/007/008/010: Scanner source gets silent cleanup
+if [ "$PENDING_SOURCE" = "scanner" ]; then
+    # Check if expired first (VAL-REG-010: expired scanner also silent cleanup)
+    if [ -n "$CREATED_AT" ]; then
+        IS_EXPIRED=$($PYTHON_BIN -c "
+from datetime import datetime, timezone, timedelta
+import sys
+try:
+    created_at = '$CREATED_AT'
+    if created_at.endswith('Z'):
+        created_at = created_at[:-1] + '+00:00'
+    created_time = datetime.fromisoformat(created_at)
+    now = datetime.now(timezone.utc)
+    age = now - created_time
+    if age > timedelta(hours=2):
+        print('yes')
+    else:
+        print('no')
+except Exception as e:
+    print('no', file=sys.stderr)
+    print('no')
+" 2>>"$LOG_FILE")
+    else
+        IS_EXPIRED="no"
+    fi
+
+    # VAL-REG-010: Expired scanner files skip cross-validation and go straight to silent cleanup
+    if [ "$IS_EXPIRED" = "yes" ]; then
+        log "Source=scanner detected (expired), performing silent cleanup (no cross-validation needed)"
+        rm -f "$PENDING_CI_FILE"
+        exit 0
+    fi
+
+    # Weak cross-validation (VAL-REG-007) - only for non-expired scanner files
+    verify_scanner_identity "$PR_NUMBER"
+    CROSS_VALIDATION_RC=$?
+
+    if [ "$CROSS_VALIDATION_RC" -eq 1 ]; then
+        # VAL-REG-007: Positive evidence of mismatch, conservative path
+        log "ERROR: Source=scanner but cross-validation failed for PR #$PR_NUMBER — conservative path (keep file, no fallback)"
+        send_posthog_event "ci_scanner_source_mismatch" "$PR_NUMBER" "cross_validation" "PR #$PR_NUMBER does not match scanner identity"
+        # Keep the file, don't spawn fallback, exit cleanly
+        exit 0
+    elif [ "$CROSS_VALIDATION_RC" -eq 2 ]; then
+        # VAL-REG-007b (D2 ruling): gh unavailable → conservative path
+        # Rationale: session file mislabeled as scanner + gh恰好不可用时，
+        # 静默清理会删除 session PR 救援通道，违背不变量 2。
+        # 保守代价仅为文件滞留 ≤2h，由过期路径 VAL-REG-010 兜底。
+        log "ERROR: Source=scanner but cross-validation unexecutable (gh unavailable) for PR #$PR_NUMBER — conservative path (keep file, anomaly event, no fallback)"
+        send_posthog_event "ci_scanner_source_unverifiable" "$PR_NUMBER" "cross_validation" "gh unavailable for PR #$PR_NUMBER"
+        # Keep the file, don't spawn fallback, exit cleanly
+        exit 0
+    else
+        # VAL-REG-005/006: Validation passed, silent cleanup
+        log "Source=scanner detected, cross-validation passed, performing silent cleanup (no fallback/events)"
+        rm -f "$PENDING_CI_FILE"
+        exit 0
+    fi
+fi
+
+# VAL-REG-008: Missing source field → default to session + log once
+if [ -z "$PENDING_SOURCE" ]; then
+    log "unknown-source defaulted to session (legacy M5 schema)"
+    # Record event exactly once (no idempotency lock needed — this log line runs once per invocation)
+fi
+
+# === M2 F6 ②: session_id null → 宁丢勿错 ===
+# rt-session-id-persist 之后，write-pending-ci.sh 未带 --session-id 时写入显式 null。
+# 此时绝不进入「按 cwd 选最近 orchestrator」的旧重绑定（Bug#002 错投根因）：
+# 宁可丢弃通知并上报告警，也不误投无关会话。照上方 ci_scanner_source_mismatch
+# 先例：保留文件 + exit 0（2h 过期清理路径仍兜底）。
+if [ -z "$SESSION_ID" ]; then
+    log "WARN: session_id null (source=${PENDING_SOURCE:-session}) — skipping injection, telemetry only (prefer losing notification over misroute)"
+    send_posthog_event "ci_no_route_target" "$PR_NUMBER" "routing" "pending has null session_id; cwd-based rebinding removed by M2 F6"
+    exit 0
+fi
+
+# Check if pending-ci-{PR_NUMBER}.json is expired (older than 2 hours)
+if [ -n "$CREATED_AT" ]; then
+    EXPIRED=$($PYTHON_BIN -c "
+from datetime import datetime, timezone, timedelta
+import sys
+try:
+    created_at = '$CREATED_AT'
+    # Parse ISO 8601 timestamp
+    if created_at.endswith('Z'):
+        created_at = created_at[:-1] + '+00:00'
+    created_time = datetime.fromisoformat(created_at)
+    now = datetime.now(timezone.utc)
+    age = now - created_time
+    if age > timedelta(hours=2):
+        print('yes')
+    else:
+        print('no')
+except Exception as e:
+    print(f'ERROR parsing created_at: {e}', file=sys.stderr)
+    print('no')  # Don't reject if parsing fails
+" 2>>"$LOG_FILE")
+    
+    if [ "$EXPIRED" = "yes" ]; then
+        log "ERROR: pending-ci-${PR_NUMBER}.json is expired (created_at: $CREATED_AT, older than 2 hours)"
+        # 路径 G 演化守卫（P1 修复）：必须在 rm 之前判定——文件删除后守卫
+        # fail-open，r1-evolution 过期 PR 会绕过拦截照常开枪（review round-2
+        # P1 实证）。阳性：不 spawn、不清文件（保留证据与 2h 过期兜底——
+        # 删除会让后续每次 webhook 重试走 missing-pending 路径无守卫派发）。
+        _evolution_guard_run "$PENDING_CI_FILE"
+        if [ "$EVOLUTION_GUARD_RESULT" = "halt_evolution" ]; then
+            log "EVOLUTION-GUARD: expired pending-ci-${PR_NUMBER}.json 带 r1-evolution 标记——不派发 fallback（文件保留防重试绕过守卫）"
+            _evolution_guard_alert "ci_fallback_evolution_blocked" "$PR_NUMBER"
+            exit 0
+        fi
+        log "Cleaning up stale pending-ci-${PR_NUMBER}.json to prevent retry loop"
+        rm -f "$PENDING_CI_FILE"
+        # PR-based ephemeral lock to prevent duplicate fallback spawns on retries
+        FALLBACK_LOCK="${LOCK_DIR}/ci-fallback-${PR_NUMBER}.lock"
+        mkdir -p "$LOCK_DIR" 2>/dev/null
+        if [ -f "$FALLBACK_LOCK" ]; then
+            FALLBACK_LOCK_AGE_SEC=$(( $(date +%s) - $(_portable_mtime "$FALLBACK_LOCK") ))
+            if [ "$FALLBACK_LOCK_AGE_SEC" -lt 0 ]; then FALLBACK_LOCK_AGE_SEC=0; fi
+            FALLBACK_LOCK_AGE=$(( FALLBACK_LOCK_AGE_SEC / 60 ))
+            if [ "$FALLBACK_LOCK_AGE" -gt 1440 ]; then FALLBACK_LOCK_AGE=1440; fi
+            if [ "$FALLBACK_LOCK_AGE" -lt 60 ]; then
+                log "SKIP: Fallback already triggered for expired PR #${PR_NUMBER} (lock age: ${FALLBACK_LOCK_AGE}min < 60min)"
+                exit 0
+            else
+                log "WARN: Stale fallback lock (${FALLBACK_LOCK_AGE}min > 60min), removing and proceeding"
+                rm -f "$FALLBACK_LOCK"
+            fi
+        fi
+        echo "$TIMESTAMP" > "$FALLBACK_LOCK" || {
+            log "ERROR: Failed to write fallback lock $FALLBACK_LOCK"
+            send_posthog_event "ci_fallback_lock_write_failed" "$PR_NUMBER" "fallback_lock" "expired-pending-ci path"
+        }
+        send_posthog_event "ci_expired_pending_ci" "$PR_NUMBER" "expiry" "pending-ci older than 2 hours, created_at=$CREATED_AT"
+        log "Created fallback lock: $FALLBACK_LOCK"
+        notify_fallback "$PR_NUMBER" "${STATUS:-unknown}" "$(pick_fallback_repo)"
+        exit 0
+    else
+        log "pending-ci-${PR_NUMBER}.json is fresh (created_at: $CREATED_AT)"
+    fi
+else
+    log "WARNING: pending-ci-${PR_NUMBER}.json missing created_at field (legacy format)"
+fi
+
+log "Pending PR from file: $PENDING_PR"
+
+# === M2 F6: 发起者绑定（verify-not-rebind）===
+# session_id 由 write-pending-ci.sh --session-id 落盘（null 为显式语义，已在
+# 上方 source 路由段以 ci_no_route_target 提前退出）。探活只针对该会话，
+# 绝不按 cwd/mtime 重绑定（Bug#002 错投根因路径已整体删除）。
+log "Pending session_id: ${SESSION_ID:-null} (verify-not-rebind routing)"
+
+# === 幂等保护：fingerprint lock ===
+# M2 F7: 键含 SHA（session:pr:sha）——不同 SHA 事件各持独立锁，互不误伤
+FINGERPRINT_KEY="${SESSION_ID:-rebinding}:${PR_NUMBER}:${SHA:-nosha}"
+FINGERPRINT="$FINGERPRINT_KEY"
+LOCK_FILE="${LOCK_DIR}/ci-complete-$(echo "$FINGERPRINT" | /usr/bin/sed 's/[^a-zA-Z0-9]/-/g').lock"
+
+mkdir -p "$LOCK_DIR" 2>/dev/null
+
+# Secondary stale lock check (timestamp-based, for locks older than 60min)
+if [ -f "$LOCK_FILE" ]; then
+    LOCK_AGE_SEC=$(( $(date +%s) - $(_portable_mtime "$LOCK_FILE") ))
+    if [ "$LOCK_AGE_SEC" -lt 0 ]; then LOCK_AGE_SEC=0; fi
+    LOCK_AGE_MIN=$(( LOCK_AGE_SEC / 60 ))
+    if [ "$LOCK_AGE_MIN" -gt 1440 ]; then LOCK_AGE_MIN=1440; fi
+    if [ "$LOCK_AGE_MIN" -ge 60 ]; then
+        log "WARN: Stale lock found (${LOCK_AGE_MIN}min > 60min), removing and proceeding"
+        rm -f "$LOCK_FILE"
+    fi
+fi
+
+# Atomic lock acquisition via flock (M1)
+exec 200>"$LOCK_FILE"
+$FLOCK_BIN -n 200 || {
+    log "SKIP: Lock held by another process for fingerprint '$FINGERPRINT'"
+    send_posthog_event "ci_lock_held" "$PR_NUMBER" "dedup" "flock rejected"
+    exit 0
+}
+
+# Write timestamp:PID to lock file (M-CI-7: check return value)
+if ! echo "$TIMESTAMP:$$" >&200; then
+    log "ERROR: Failed to write to lock file $LOCK_FILE"
+    send_posthog_event "ci_lock_write_failed" "$PR_NUMBER" "lock" "echo failed"
+    exit 1
+fi
+log "Created lock file: $LOCK_FILE"
+
+# === F3 Branch A: Check sessions-index freshness ===
+# Cross-verifies if a session is actually alive despite probe 404.
+# Returns "1" if session exists in index with mtime < max_age_hours, "0" otherwise.
+# Rationale: Factory API may return 404 for sessions that are alive in sessions-index
+# (daemon idle/timeout/platform delay). Probe 404 ≠ session death.
+check_sessions_index_fresh() {
+    local session_id="$1"
+    local index_file="$2"
+    local max_age_hours="${3:-72}"
+    
+    if [ ! -f "$index_file" ]; then
+        echo "0"
+        return
+    fi
+    
+    # Pass variables as sys.argv to avoid quoting issues
+    $PYTHON_BIN -c "
+import json, sys, time
+try:
+    index_file = sys.argv[1]
+    target_session_id = sys.argv[2]
+    max_age_sec = float(sys.argv[3]) * 3600
+    with open(index_file) as f:
+        data = json.load(f)
+    now = time.time()
+    for entry in data.get('entries', []):
+        if entry.get('sessionId') == target_session_id:
+            mtime = entry.get('mtime', 0)
+            # Normalize: if mtime is in milliseconds (> 1e12), convert to seconds
+            if mtime > 1e12:
+                mtime = mtime / 1000.0
+            age = now - mtime
+            if age < max_age_sec:
+                print('1')  # fresh
+                sys.exit(0)
+            else:
+                print('0')  # stale
+                sys.exit(0)
+    print('0')  # not found
+except Exception as e:
+    print('0')  # error = treat as stale
+" "$index_file" "$session_id" "$max_age_hours" 2>>"$LOG_FILE"
+}
+
+# === M2 F6 ④: 404 豁免的角色/标签双匹配 ===
+# 收窄后的「探活 404 仍注入」豁免，除 ≤30min 新鲜度外还要求 index 条目
+# 同时带 mission-session 标签且该标签 metadata role=orchestrator（双匹配）。
+# 找不到条目 / 解析失败 → 无匹配（fail-closed，宁可 fallback 不盲注）。
+# Returns "1" on double match, "0" otherwise.
+session_entry_role_matches() {
+    local session_id="$1"
+    local index_file="$2"
+
+    if [ ! -f "$index_file" ]; then
+        echo "0"
+        return
+    fi
+
+    $PYTHON_BIN -c "
+import json, sys
+try:
+    with open(sys.argv[1]) as f:
+        data = json.load(f)
+    target = sys.argv[2]
+    for entry in data.get('entries', []):
+        if entry.get('sessionId') != target:
+            continue
+        for tag in entry.get('tags', []):
+            if tag.get('name') == 'mission-session' and tag.get('metadata', {}).get('role') == 'orchestrator':
+                print('1')
+                sys.exit(0)
+        print('0')
+        sys.exit(0)
+    print('0')
+except Exception:
+    print('0')
+" "$index_file" "$session_id" 2>>"$LOG_FILE"
+}
+
+# === 从 1Password MCP 读取 Factory token ===
+if [ -z "${FACTORY_TOKEN:-}" ]; then
+    log "Reading Factory token from 1Password MCP..."
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    if [ -f "${SCRIPT_DIR}/lib/op-mcp.sh" ]; then
+        source "${SCRIPT_DIR}/lib/op-mcp.sh"
+        FACTORY_TOKEN=$(op_get_field "$OP_VAULT_SEVER" "$OP_ITEM_ID" "$OP_FIELD_LABEL" || true)
+    else
+        log "WARNING: op-mcp.sh not found, FACTORY_TOKEN must be set in environment"
+    fi
+else
+    log "Using FACTORY_TOKEN from environment"
+fi
+
+if [ -z "$FACTORY_TOKEN" ]; then
+    log "ERROR: Failed to read Factory token from 1Password"
+    send_posthog_event "ci_token_read_failed" "$PR_NUMBER" "auth" "1Password read failed"
+    rm -f "$LOCK_FILE"
+    exit 0
+fi
+
+# 验证 token 格式（应以 fk- 开头）
+if [[ ! "$FACTORY_TOKEN" =~ ^fk- ]]; then
+    log "ERROR: Factory token does not start with 'fk-' prefix"
+    send_posthog_event "ci_token_format_error" "$PR_NUMBER" "auth" "Token missing fk- prefix"
+    rm -f "$LOCK_FILE"
+    exit 0
+fi
+
+log "Factory token retrieved successfully (prefix: ${FACTORY_TOKEN:0:10}...)"
+
+# === M2 F6: 发起者绑定路由（verify-not-rebind，仅验证不换人） ===
+# 走到这里 session_id 必非空：null 已在 source 路由段以 ci_no_route_target 退出，
+# scanner 来源在更早的分流段静默清理。
+# ① 只探活 pending 指定的会话：活着 → 注入；死亡 → notify_fallback 记录
+#    （M1-D 起零执行体：Mac 腿纯通知，fallback 仅审计记录不派发）。
+#    旧「按 cwd+mtime 选最近 orchestrator」重绑定已整体删除（Bug#002 错投根因）。
+# ④ 探活 404 仍注入的豁免收窄：72h 单条件 → ≤30min 新鲜度 且 角色/标签双匹配。
+if [ -n "$SESSION_ID" ]; then
+    PROBE_URL="${FACTORY_API_BASE}/sessions/${SESSION_ID}"
+    log "Verifying pending session (verify-not-rebind): GET $PROBE_URL"
+
+    PROBE_RESPONSE=$(curl -s -w "\n%{http_code}" -X GET "$PROBE_URL" \
+        -H "Authorization: Bearer $FACTORY_TOKEN" \
+        --connect-timeout 10 --max-time 15 2>>"$LOG_FILE") || PROBE_RESPONSE=$'\n000'
+    PROBE_CODE=$(echo "$PROBE_RESPONSE" | tail -n1)
+
+    log "Probe HTTP Response Code: $PROBE_CODE"
+
+    if [[ "$PROBE_CODE" =~ ^2 ]]; then
+        log "Session $SESSION_ID is alive (probe HTTP $PROBE_CODE), using it"
+    elif [ "$PROBE_CODE" = "404" ]; then
+        # 404 ≠ 直接判死：先查收窄后的豁免（index ≤30min 活跃 且 条目角色/标签双匹配）
+        INDEX_FRESH=$(check_sessions_index_fresh "$SESSION_ID" "$SESSIONS_INDEX" 0.5)
+        ROLE_OK=$(session_entry_role_matches "$SESSION_ID" "$SESSIONS_INDEX")
+        if [ "$INDEX_FRESH" = "1" ] && [ "$ROLE_OK" = "1" ]; then
+            log "WARN: Probe 404 but sessions-index shows recent activity for $SESSION_ID, attempting POST anyway"
+        else
+            log "Session $SESSION_ID is dead (probe HTTP $PROBE_CODE, index stale or role/tag mismatch) — fallback record, no rebind"
+            send_posthog_event "ci_probe_failed_session_not_found" "$PR_NUMBER" "probe" "session_id=$SESSION_ID"
+
+            # 直接记录 fallback，不烧 POST 重试
+            rm -f "$LOCK_FILE"
+            exec 200>&-
+            FALLBACK_LOCK="${LOCK_DIR}/ci-fallback-${PR_NUMBER}.lock"
+            if [ -f "$FALLBACK_LOCK" ]; then
+                FALLBACK_LOCK_AGE_SEC=$(( $(date +%s) - $(_portable_mtime "$FALLBACK_LOCK") ))
+                if [ "$FALLBACK_LOCK_AGE_SEC" -lt 0 ]; then FALLBACK_LOCK_AGE_SEC=0; fi
+                FALLBACK_LOCK_AGE=$(( FALLBACK_LOCK_AGE_SEC / 60 ))
+                if [ "$FALLBACK_LOCK_AGE" -gt 1440 ]; then FALLBACK_LOCK_AGE=1440; fi
+                if [ "$FALLBACK_LOCK_AGE" -lt 60 ]; then
+                    log "SKIP: Fallback already triggered for PR #${PR_NUMBER} (probe dedup, lock age: ${FALLBACK_LOCK_AGE}min < 60min)"
+                    exit 0
+                else
+                    log "WARN: Stale fallback lock (${FALLBACK_LOCK_AGE}min > 60min), removing and proceeding"
+                    rm -f "$FALLBACK_LOCK"
+                fi
+            fi
+            echo "$TIMESTAMP" > "$FALLBACK_LOCK" || {
+                log "ERROR: Failed to write fallback lock $FALLBACK_LOCK"
+                send_posthog_event "ci_fallback_lock_write_failed" "$PR_NUMBER" "fallback_lock" "probe path"
+            }
+            log "Created fallback lock: $FALLBACK_LOCK"
+            notify_fallback "$PR_NUMBER" "${STATUS:-probe_failed}" "$(pick_fallback_repo)"
+            exit 0
+        fi
+    else
+        # 5xx/000 — probe unavailable ≠ death; still treat as candidate
+        log "Session $SESSION_ID probe unavailable (probe HTTP $PROBE_CODE), using it anyway"
+    fi
+fi
+
+# Build fingerprint key from resolved session_id (log-only; lock file already acquired above)
+FINGERPRINT_KEY="${SESSION_ID}:${PR_NUMBER}:${SHA:-nosha}"
+log "Final fingerprint key: $FINGERPRINT_KEY (SESSION_ID=$SESSION_ID)"
+
+# === 构造注入消息 ===
+# M1-D（v3.2.2 C3，VAL-M1-008）：注入文案为纯通知体——合并由 GitHub 侧守卫腿
+# （auto-merge pipeline，REST 三门绿判唯一入口）负责；会话收到通知后禁止手动合并。
+if [ "$STATUS" = "passed" ] || [ "$STATUS" = "success" ]; then
+    INJECT_TEXT="CI 通知: PR #${PR_NUMBER} CI 完成（状态: ${STATUS:-unknown}）。分支: ${BRANCH:-unknown}, SHA: ${SHA:-unknown}。合并由守卫腿按 REST 三门绿判自动推进，本会话禁手动合并。"
+else
+    INJECT_TEXT="CI 通知: PR #${PR_NUMBER} 状态为 ${STATUS:-unknown}。分支: ${BRANCH:-unknown}, SHA: ${SHA:-unknown}。合并由守卫腿按 REST 三门绿判自动推进，本会话禁手动合并。"
+fi
+
+log "Injecting message: $INJECT_TEXT"
+
+# === POST 到 Sessions API（带 5xx 重试）===
+API_URL="${FACTORY_API_BASE}/sessions/${SESSION_ID}/messages"
+
+log "POSTing to $API_URL with computerId=$COMPUTER_ID"
+
+# 重试参数（可通过环境变量覆盖以加速测试）
+MAX_RETRIES="${MAX_RETRIES:-3}"
+RETRY_DELAY="${RETRY_DELAY:-10}"
+
+# 使用 curl POST，捕获 HTTP 响应码和 body（5xx 自动重试）
+ATTEMPT=0
+HTTP_CODE="000"
+HTTP_BODY=""
+
+while [ "$ATTEMPT" -lt "$MAX_RETRIES" ]; do
+    ATTEMPT=$((ATTEMPT + 1))
+    log "Attempt $ATTEMPT/$MAX_RETRIES..."
+
+    HTTP_RESPONSE=$(curl -s -w "\n%{http_code}" -X POST "$API_URL" \
+        -H "Authorization: Bearer $FACTORY_TOKEN" \
+        -H "Content-Type: application/json" \
+        --connect-timeout 15 --max-time 45 \
+        -d "{
+            \"text\": \"$INJECT_TEXT\",
+            \"computerId\": \"$COMPUTER_ID\"
+        }" 2>>"$LOG_FILE") || HTTP_RESPONSE=$'\n000'
+
+    HTTP_BODY=$(echo "$HTTP_RESPONSE" | sed '$ d')
+    HTTP_CODE=$(echo "$HTTP_RESPONSE" | tail -n1)
+
+    log "HTTP Response Code: $HTTP_CODE"
+    log "HTTP Response Body: $HTTP_BODY"
+
+    # 成功或 4xx 客户端错误，不需要重试
+    if [[ "$HTTP_CODE" =~ ^2 ]] || [[ "$HTTP_CODE" =~ ^4 ]]; then
+        break
+    fi
+
+    # 5xx 错误，等待后重试
+    if [[ "$HTTP_CODE" =~ ^5 ]] || [ "$HTTP_CODE" = "000" ]; then
+        if [ "$ATTEMPT" -lt "$MAX_RETRIES" ]; then
+            log "Server error (HTTP $HTTP_CODE), retrying in ${RETRY_DELAY}s..."
+            sleep "$RETRY_DELAY"
+            RETRY_DELAY=$((RETRY_DELAY * 2))
+        fi
+    fi
+done
+
+# === 检查 API 响应 ===
+if [[ "$HTTP_CODE" =~ ^2 ]]; then
+    # 验证响应包含 messageId
+    MESSAGE_ID=$(echo "$HTTP_BODY" | $PYTHON_BIN -c "
+import json, sys
+try:
+    data = json.load(sys.stdin)
+    print(data.get('messageId', ''))
+except:
+    print('')
+" 2>>"$LOG_FILE")
+
+    if [ -n "$MESSAGE_ID" ]; then
+        log "SUCCESS: Message injected with messageId=$MESSAGE_ID"
+
+        # 不删除 pending-ci-{PR_NUMBER}.json，改为标记 injected_at 用于对账
+        # 修复 daemon-hung session 问题：消息已发送但目标 session 空闲无法消费
+        # ci-timeout-watchdog.sh 会在 45 分钟后检查 injected_at，若 PR 仍未合并则触发清理
+        # M2 F7 ②: 注入历史改按 SHA 追加（injections[] 审计轨迹，条目含 sha/injected_at/
+        # message_id）；顶层 injected_at/message_id 保留——ci-timeout-watchdog.sh 只读顶层
+        # injected_at（Phase B 对账），删除即破坏 watchdog 兼容面。pending 文件丢失/损坏时
+        # fail-open：注入已成功，只跳过审计不回滚不重投。
+        INJECTED_AT=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+        $PYTHON_BIN - "$PENDING_CI_FILE" "$SHA" "$INJECTED_AT" "$MESSAGE_ID" <<'PYEOF' 2>>"$LOG_FILE"
+import json, sys
+pending_file, sha, injected_at, message_id = sys.argv[1:5]
+try:
+    with open(pending_file, 'r') as f:
+        data = json.load(f)
+except Exception as e:
+    print(f'Pending file unreadable, audit entry skipped: {e}', file=sys.stderr)
+    sys.exit(0)
+entry = {'sha': sha, 'injected_at': injected_at, 'message_id': message_id}
+data.setdefault('injections', []).append(entry)
+data['last_injected_sha'] = sha
+data['injected_at'] = injected_at
+data['message_id'] = message_id
+with open(pending_file, 'w') as f:
+    json.dump(data, f)
+PYEOF
+        log "Marked pending-ci-${PR_NUMBER}.json with injected_at=$INJECTED_AT (will be cleaned up by watchdog if PR not merged in 45min)"
+
+        # M2 F7 ①: per-SHA 状态条目（重复事件整跑跳过的开关，键=sha:session:pr:sha）。
+        # message_id 先过字符白名单净化（API 返回值直接进 JSON 载荷，非常规值降级丢弃）；
+        # 写入失败仅告警不退出——宁可重复注入，不可丢跳过语义外的任何东西。
+        SAFE_MESSAGE_ID=$(printf '%s' "$MESSAGE_ID" | $PYTHON_BIN -c "
+import sys
+value = sys.stdin.read()
+print(value if value and all(ch.isalnum() or ch in '-_' for ch in value) else '')
+" 2>>"$LOG_FILE")
+        if [ -n "$SAFE_MESSAGE_ID" ]; then
+            STATE_PAYLOAD=$(printf '{"fingerprint":"sha:%s:%s:%s","injected_at":"%s","message_id":"%s"}' "${SESSION_ID:-rebinding}" "$PR_NUMBER" "${SHA:-nosha}" "$INJECTED_AT" "$SAFE_MESSAGE_ID")
+        else
+            log "WARN: messageId not state-file-safe, writing SHA state marker without it"
+            STATE_PAYLOAD=$(printf '{"fingerprint":"sha:%s:%s:%s","injected_at":"%s"}' "${SESSION_ID:-rebinding}" "$PR_NUMBER" "${SHA:-nosha}" "$INJECTED_AT")
+        fi
+        if [ -n "$STATE_PAYLOAD" ] \
+            && printf '%s' "$STATE_PAYLOAD" > "$SHA_STATE_FILE" \
+            && $PYTHON_BIN -c "import json,sys; json.load(open(sys.argv[1]))" "$SHA_STATE_FILE" 2>>"$LOG_FILE"; then
+            log "SHA state marked: $SHA_STATE_FILE"
+        else
+            rm -f "$SHA_STATE_FILE"
+            log "WARN: Failed to write valid SHA state file — duplicate events may re-inject"
+            send_posthog_event "ci_sha_state_write_failed" "$PR_NUMBER" "dedup" "path=$SHA_STATE_FILE"
+        fi
+    else
+        log "WARN: HTTP 200 but no messageId in response"
+        send_posthog_event "ci_no_message_id" "$PR_NUMBER" "factory_api" "HTTP 200 without messageId"
+    fi
+else
+    log "ERROR: API call failed with HTTP $HTTP_CODE"
+    log "Response body: $HTTP_BODY"
+    
+    # Report failure to PostHog
+    send_posthog_event "ci_inject_failed" "$PR_NUMBER" "factory_api" "HTTP $HTTP_CODE"
+    
+    # 不清除 lock，让下次重试（如果是临时错误）
+    # 但如果是 4xx 错误（如 404 session 不存在），应该清除 lock
+    if [[ "$HTTP_CODE" =~ ^4 ]]; then
+        log "Client error (4xx), removing lock and triggering fallback"
+        rm -f "$LOCK_FILE"
+        # Close fd 200 to prevent lock leak on unlinked inode
+        exec 200>&-
+        # H2: 4xx fallback dedup lock (same 60min TTL as missing-pending-ci path)
+        FALLBACK_LOCK="${LOCK_DIR}/ci-fallback-${PR_NUMBER}.lock"
+        if [ -f "$FALLBACK_LOCK" ]; then
+            FALLBACK_LOCK_AGE_SEC=$(( $(date +%s) - $(_portable_mtime "$FALLBACK_LOCK") ))
+            if [ "$FALLBACK_LOCK_AGE_SEC" -lt 0 ]; then FALLBACK_LOCK_AGE_SEC=0; fi
+            FALLBACK_LOCK_AGE=$(( FALLBACK_LOCK_AGE_SEC / 60 ))
+            if [ "$FALLBACK_LOCK_AGE" -gt 1440 ]; then FALLBACK_LOCK_AGE=1440; fi
+            if [ "$FALLBACK_LOCK_AGE" -lt 60 ]; then
+                log "SKIP: Fallback already triggered for PR #${PR_NUMBER} (4xx dedup, lock age: ${FALLBACK_LOCK_AGE}min < 60min)"
+                exit 0
+            else
+                log "WARN: Stale fallback lock (${FALLBACK_LOCK_AGE}min > 60min), removing and proceeding"
+                rm -f "$FALLBACK_LOCK"
+            fi
+        fi
+        echo "$TIMESTAMP" > "$FALLBACK_LOCK" || {
+            log "ERROR: Failed to write fallback lock $FALLBACK_LOCK"
+            send_posthog_event "ci_fallback_lock_write_failed" "$PR_NUMBER" "fallback_lock" "echo failed"
+        }
+        log "Created fallback lock: $FALLBACK_LOCK"
+        notify_fallback "$PR_NUMBER" "$STATUS" "$(pick_fallback_repo)"
+    else
+        log "Server error (5xx), keeping lock for potential retry"
+        # TD-DR-03: 5xx 重试耗尽后同步降级为记录，不再只留锁等 watchdog 30min
+        if [ "$ATTEMPT" -ge "$MAX_RETRIES" ]; then
+            log "WARN: All $MAX_RETRIES retries exhausted (last HTTP $HTTP_CODE), triggering synchronous fallback"
+            send_posthog_event "injection_daemon_504" "$PR_NUMBER" "factory_api" "HTTP $HTTP_CODE after $MAX_RETRIES retries"
+            # 标记锁文件为已走 fallback 路径（防 watchdog 重复补救）
+            echo "$TIMESTAMP:fallback" >&200
+            # 复用 4xx 的去重逻辑（60min TTL 防风暴）
+            FALLBACK_LOCK="${LOCK_DIR}/ci-fallback-${PR_NUMBER}.lock"
+            if [ -f "$FALLBACK_LOCK" ]; then
+                FALLBACK_LOCK_AGE_SEC=$(( $(date +%s) - $(_portable_mtime "$FALLBACK_LOCK") ))
+                if [ "$FALLBACK_LOCK_AGE_SEC" -lt 0 ]; then FALLBACK_LOCK_AGE_SEC=0; fi
+                FALLBACK_LOCK_AGE=$(( FALLBACK_LOCK_AGE_SEC / 60 ))
+                if [ "$FALLBACK_LOCK_AGE" -gt 1440 ]; then FALLBACK_LOCK_AGE=1440; fi
+                if [ "$FALLBACK_LOCK_AGE" -lt 60 ]; then
+                    log "SKIP: Fallback already triggered for PR #${PR_NUMBER} (5xx dedup, lock age: ${FALLBACK_LOCK_AGE}min < 60min)"
+                    exit 0
+                else
+                    log "WARN: Stale fallback lock (${FALLBACK_LOCK_AGE}min > 60min), removing and proceeding"
+                    rm -f "$FALLBACK_LOCK"
+                fi
+            fi
+            echo "$TIMESTAMP" > "$FALLBACK_LOCK" || {
+                log "ERROR: Failed to write fallback lock $FALLBACK_LOCK"
+                send_posthog_event "ci_fallback_lock_write_failed" "$PR_NUMBER" "fallback_lock" "5xx path"
+            }
+            log "Created fallback lock: $FALLBACK_LOCK"
+            notify_fallback "$PR_NUMBER" "$STATUS" "$(pick_fallback_repo)"
+        fi
+    fi
+    exit 0
+fi
+
+# === 清理 ===
+log "CI complete notification processed successfully"
+
+log "=== trigger-ci-droid.sh completed ==="
+
+# 保持 lock 文件（60 分钟内防止重复触发）
+# lock 会在 60 分钟后自动过期
+
+exit 0
